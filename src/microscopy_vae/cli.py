@@ -1,0 +1,398 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import torch
+
+from microscopy_vae.config.loader import load_config, resolved_dict
+from microscopy_vae.config.validation import validate_for_training
+
+
+def _parse_override(items: list[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for item in items:
+        if "=" not in item:
+            raise SystemExit(f"Override must be key=value, got {item!r}")
+        key, raw = item.split("=", 1)
+        try:
+            val: Any = json.loads(raw)
+        except json.JSONDecodeError:
+            val = raw
+        parts = key.split(".")
+        cur = out
+        for p in parts[:-1]:
+            cur = cur.setdefault(p, {})
+        cur[parts[-1]] = val
+    return out
+
+
+def _add_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--config", type=str, default=None)
+    p.add_argument("--override", action="append", default=[], help="dotted.key=JSON_or_str")
+    p.add_argument("--print-resolved-config", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+
+
+def _cfg(args: argparse.Namespace):
+    return load_config(Path(args.config) if args.config else None, _parse_override(args.override or []))
+
+
+def cmd_validate_config(args: argparse.Namespace) -> int:
+    cfg = _cfg(args)
+    validate_for_training(cfg)
+    if args.print_resolved_config:
+        print(json.dumps(resolved_dict(cfg), indent=2, sort_keys=True))
+    print("OK: config valid")
+    return 0
+
+
+def cmd_smoke_test(args: argparse.Namespace) -> int:
+    cfg = _cfg(args)
+    cfg.training.max_steps = min(cfg.training.max_steps, 4)
+    from microscopy_vae.engine.trainer import Trainer
+
+    trainer = Trainer(cfg)
+    info = trainer.dry_run()
+    print(json.dumps(info, indent=2, default=str))
+    if info.get("has_test_loader"):
+        raise SystemExit("FAIL: test loader must not exist")
+    if args.dry_run:
+        print("OK: dry-run only")
+        return 0
+    result = trainer.train(max_steps=2)
+    print(json.dumps({k: result[k] for k in ("final_step", "final_loss", "checkpoint")}, indent=2))
+    print("OK: smoke-test")
+    return 0
+
+
+def cmd_overfit_small(args: argparse.Namespace) -> int:
+    cfg = _cfg(args)
+    from microscopy_vae.engine.trainer import Trainer
+
+    trainer = Trainer(cfg)
+    result = trainer.overfit_small()
+    print(json.dumps(result, indent=2))
+    return 0 if result["passed"] else 2
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    cfg = _cfg(args)
+    from microscopy_vae.engine.trainer import Trainer
+
+    trainer = Trainer(cfg)
+    if args.dry_run:
+        print(json.dumps(trainer.dry_run(), indent=2, default=str))
+        return 0
+    result = trainer.train()
+    print(
+        json.dumps(
+            {k: result[k] for k in ("final_step", "final_loss", "checkpoint", "candidate_hits")},
+            indent=2,
+            default=str,
+        )
+    )
+    return 0
+
+
+def cmd_fit_normalizer(args: argparse.Namespace) -> int:
+    cfg = _cfg(args)
+    from microscopy_vae.data.normalization import fit_robust_normalizer
+    from microscopy_vae.data.synthetic import build_synthetic_hq_pool
+
+    if cfg.data.mode == "synthetic":
+        pages = build_synthetic_hq_pool(
+            n_groups=cfg.data.synthetic_n_groups,
+            pages_per_group=cfg.data.synthetic_pages_per_group,
+            size=cfg.data.synthetic_size,
+            seed=cfg.experiment.seed,
+        )
+        train = [p.image for p in pages if p.split == "train"]
+    else:
+        raise SystemExit("fit-normalizer for hq_pool: use train path via Trainer (auto-fits)")
+    state = fit_robust_normalizer(train, method=cfg.normalization.method, clip=cfg.normalization.clip)
+    out = Path(args.out or "normalizer.json")
+    state.save(out)
+    print(f"Wrote {out} transform_id={state.transform_id} low={state.low} high={state.high}")
+    return 0
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    cfg = _cfg(args)
+    from microscopy_vae.systems.factory import build_hq_codec_system
+
+    system = build_hq_codec_system(cfg)
+    print(json.dumps(system.vae.count_parameters(), indent=2))
+    return 0
+
+
+def cmd_inspect_data(args: argparse.Namespace) -> int:
+    """Bounded audit summary — no pixels, no raw paths in output."""
+    cfg = _cfg(args)
+    from microscopy_vae.data.synthetic import build_synthetic_hq_pool, pool_summary
+    from microscopy_vae.data.manifest import load_hq_manifest, summarize_records
+    from microscopy_vae.provenance.hashing import sha256_json
+
+    out: Dict[str, Any] = {
+        "schema_version": "microvae-inspect-data-v1",
+        "mode": cfg.data.mode,
+        "allowed_splits": list(cfg.data.allow_splits),
+        "test_refused": True,
+    }
+    if cfg.data.mode == "synthetic":
+        pages = build_synthetic_hq_pool(
+            n_groups=cfg.data.synthetic_n_groups,
+            pages_per_group=cfg.data.synthetic_pages_per_group,
+            size=cfg.data.synthetic_size,
+            seed=cfg.experiment.seed,
+        )
+        # strip anything that could be a path
+        out["summary"] = pool_summary(pages)
+        out["sources"] = sorted({p.source for p in pages})
+        out["morphologies"] = sorted({p.morphology for p in pages})
+    elif cfg.data.mode == "hq_pool":
+        if not cfg.data.manifest_path:
+            raise SystemExit("hq_pool requires data.manifest_path")
+        recs = load_hq_manifest(
+            Path(cfg.data.manifest_path), allow_splits=("train", "val"), refuse_test=True
+        )
+        out["summary"] = summarize_records(recs)
+        # anonymized: only counts, not paths
+        out["n_unique_paths"] = len({str(r.hq_path) for r in recs})
+    else:
+        raise SystemExit(f"inspect-data does not support mode={cfg.data.mode}")
+    out["content_sha256"] = sha256_json(out)
+    print(json.dumps(out, indent=2, sort_keys=True))
+    # size bound soft check
+    if len(json.dumps(out)) > 5_000_000:
+        raise SystemExit("inspect-data output exceeded size bound")
+    return 0
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    cfg = _cfg(args)
+    from microscopy_vae.engine.trainer import Trainer
+    from microscopy_vae.engine.evaluator import evaluate_hq_loader
+    from microscopy_vae.engine.checkpoint import CheckpointManager
+
+    # force short synthetic if needed
+    trainer = Trainer(cfg)
+    weights = args.weights
+    if weights:
+        CheckpointManager.load_exported_weights(Path(weights), trainer.system.vae)
+    metrics = evaluate_hq_loader(
+        trainer.system,
+        trainer.val_loader,
+        device=trainer.device,
+        use_posterior_mean=cfg.evaluation.use_posterior_mean,
+        bootstrap_n=cfg.bootstrap.n_resamples,
+        bootstrap_seed=cfg.bootstrap.seed,
+    )
+    # drop heavy page list for stdout unless --full
+    if not args.full:
+        metrics = {k: v for k, v in metrics.items() if k not in ("page_metrics", "group_ids")}
+    print(json.dumps(metrics, indent=2, default=float))
+    return 0
+
+
+def cmd_infer(args: argparse.Namespace) -> int:
+    cfg = _cfg(args)
+    from microscopy_vae.systems.factory import build_hq_codec_system
+    from microscopy_vae.engine.checkpoint import CheckpointManager
+    from microscopy_vae.inference.tiling import reconstruct_full, reconstruct_tiled
+    from microscopy_vae.data.readers import read_page
+    from microscopy_vae.data.normalization import NormalizationState, Normalizer
+    import numpy as np
+
+    if not args.input or not args.output:
+        raise SystemExit("infer requires --input and --output")
+    system = build_hq_codec_system(cfg)
+    if args.weights:
+        CheckpointManager.load_exported_weights(Path(args.weights), system.vae)
+    system.eval()
+    page, _ = read_page(Path(args.input), int(args.page))
+    if args.normalizer:
+        norm = Normalizer(NormalizationState.load(Path(args.normalizer)))
+        x_np = norm.transform(page)
+    else:
+        x_np = page.astype(np.float32)
+    x = torch.from_numpy(x_np).unsqueeze(0).unsqueeze(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    system = system.to(device)
+    x = x.to(device)
+    with torch.no_grad():
+        if args.tiled:
+            y = reconstruct_tiled(
+                system.vae,
+                x,
+                tile_size=int(args.tile_size),
+                overlap=int(args.overlap),
+                spatial_compression=system.vae.spatial_compression,
+            )
+        else:
+            y = reconstruct_full(
+                system.vae, x, spatial_compression=system.vae.spatial_compression
+            )
+    y_np = y.squeeze().cpu().numpy().astype(np.float32)
+    if args.normalizer:
+        y_np = norm.inverse(y_np)
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.suffix.lower() in {".tif", ".tiff"}:
+        import tifffile
+
+        tifffile.imwrite(str(out), y_np)
+    else:
+        np.save(str(out), y_np)
+    print(json.dumps({"output": str(out), "shape": list(y_np.shape)}, indent=2))
+    return 0
+
+
+def cmd_export_latent_spec(args: argparse.Namespace) -> int:
+    cfg = _cfg(args)
+    from microscopy_vae.engine.trainer import Trainer
+    from microscopy_vae.engine.checkpoint import CheckpointManager
+    from microscopy_vae.models.factory import architecture_id
+    from microscopy_vae.models.latent_spec import build_latent_spec, fit_latent_center_scale
+    from microscopy_vae.provenance.hashing import sha256_file
+
+    trainer = Trainer(cfg)
+    if args.weights:
+        CheckpointManager.load_exported_weights(Path(args.weights), trainer.system.vae)
+    trainer.system.eval()
+    means = []
+    with torch.no_grad():
+        for bi, batch in enumerate(trainer.train_loader):
+            if bi >= int(args.max_batches):
+                break
+            x = batch.hq.to(trainer.device)
+            post, _ = trainer.system.encode_hq(x, sample_posterior=False)
+            means.append(post.mean.cpu())
+    center, scale = fit_latent_center_scale(means)
+    wsha = sha256_file(Path(args.weights)) if args.weights else "unspecified"
+    spec = build_latent_spec(
+        architecture_id=architecture_id(trainer.system.vae),
+        weights_sha256=wsha,
+        config_sha256=trainer.config_sha,
+        normalizer_sha256=trainer.normalizer_sha,
+        spatial_compression=trainer.system.vae.spatial_compression,
+        latent_channels=trainer.system.vae.latent_channels,
+        center=center,
+        scale=scale,
+        stats_sha256="fit_on_train_batches",
+        transform_id=trainer.normalizer.state.transform_id,
+        padding_mode=cfg.latent.padding_mode,
+    )
+    out = Path(args.out or "latent_spec.json")
+    spec.to_json(out)
+    print(f"Wrote {out}")
+    print(json.dumps(spec.to_dict(), indent=2))
+    return 0
+
+
+def cmd_export_weights(args: argparse.Namespace) -> int:
+    """Export inference-only weights (not a resume_exact package)."""
+    cfg = _cfg(args)
+    from microscopy_vae.engine.trainer import Trainer
+    from microscopy_vae.engine.checkpoint import CheckpointManager
+    from microscopy_vae.utils.atomic import atomic_write_bytes
+    import io
+
+    trainer = Trainer(cfg)
+    if args.weights:
+        CheckpointManager.load_exported_weights(Path(args.weights), trainer.system.vae)
+    out = Path(args.out or "exported_vae.pt")
+    buf = io.BytesIO()
+    torch.save(
+        {
+            "format": "microvae-export-v1",
+            "mode": "load_exported_weights",
+            "model": trainer.system.vae.state_dict(),
+            "config_sha256": trainer.config_sha,
+            "note": "inference only; do not use as resume_exact",
+        },
+        buf,
+    )
+    atomic_write_bytes(out, buf.getvalue())
+    print(f"Wrote {out}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="microscopy-vae", description="Scratch microscopy VAE CLI")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    for name in [
+        "validate-config",
+        "smoke-test",
+        "overfit-small",
+        "train",
+        "profile",
+        "fit-normalizer",
+        "inspect-data",
+        "evaluate",
+        "infer",
+        "export-latent-spec",
+        "export-weights",
+        "freeze-candidate",
+        "launch-seeds",
+        "aggregate-seeds",
+    ]:
+        sp = sub.add_parser(name)
+        _add_common(sp)
+        if name == "fit-normalizer":
+            sp.add_argument("--out", type=str, default="normalizer.json")
+        if name == "evaluate":
+            sp.add_argument("--weights", type=str, default=None)
+            sp.add_argument("--full", action="store_true")
+        if name == "infer":
+            sp.add_argument("--input", type=str, default=None)
+            sp.add_argument("--output", type=str, default=None)
+            sp.add_argument("--weights", type=str, default=None)
+            sp.add_argument("--normalizer", type=str, default=None)
+            sp.add_argument("--page", type=int, default=0)
+            sp.add_argument("--tiled", action="store_true")
+            sp.add_argument("--tile-size", type=int, default=256)
+            sp.add_argument("--overlap", type=int, default=32)
+        if name == "export-latent-spec":
+            sp.add_argument("--weights", type=str, default=None)
+            sp.add_argument("--out", type=str, default="latent_spec.json")
+            sp.add_argument("--max-batches", type=int, default=8)
+        if name == "export-weights":
+            sp.add_argument("--weights", type=str, default=None)
+            sp.add_argument("--out", type=str, default="exported_vae.pt")
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    dispatch = {
+        "validate-config": cmd_validate_config,
+        "smoke-test": cmd_smoke_test,
+        "overfit-small": cmd_overfit_small,
+        "train": cmd_train,
+        "fit-normalizer": cmd_fit_normalizer,
+        "profile": cmd_profile,
+        "inspect-data": cmd_inspect_data,
+        "evaluate": cmd_evaluate,
+        "infer": cmd_infer,
+        "export-latent-spec": cmd_export_latent_spec,
+        "export-weights": cmd_export_weights,
+    }
+    if args.command not in dispatch:
+        print(
+            f"Command {args.command!r} reserved for later orchestration "
+            "(freeze-candidate / launch-seeds / aggregate-seeds).",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+    code = dispatch[args.command](args)
+    raise SystemExit(code)
+
+
+if __name__ == "__main__":
+    main()

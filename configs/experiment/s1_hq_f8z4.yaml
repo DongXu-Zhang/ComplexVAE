@@ -1,0 +1,88 @@
+schema_version: microvae-config-v1
+experiment:
+  name: s1_hq_f8z4
+  route: hq_codec
+  output_dir: runs/s1_hq_f8z4
+  seed: 0
+  allow_existing_output: false
+data:
+  mode: synthetic
+  # Replace with hq_pool + manifest_path on the server
+  synthetic_n_groups: 8
+  synthetic_pages_per_group: 4
+  synthetic_size: 256
+normalization:
+  method: robust_linear_p0.1_p99.9
+  fit_split: train
+  clip: false          # linear-head codec: preserve negative HQ intensities and tails
+  ssim_data_range: 1.0 # reference scale for SSIM C1/C2 in the normalized domain
+  fit_mode: source_balanced
+  max_pages_fit: 192
+  max_pixels_per_page: 65536
+crop:
+  size: 256
+model:
+  in_channels: 1
+  out_channels: 1
+  latent_channels: 4
+  encoder_block_out_channels: [128, 256, 512, 512]
+  decoder_block_out_channels: [96, 192, 384, 384]
+  layers_per_block: 2
+  norm_num_groups: 32
+  mid_block_add_attention: true
+  output_activation: linear
+initialization:
+  mode: fresh_init
+task:
+  name: hq_codec
+  sample_posterior: true
+loss:
+  w_char: 1.0
+  w_ms_ssim: 0.1
+  w_grad: 0.05
+  w_flux: 0.01
+  free_nats: 0.5
+  ms_ssim_start_step: 1000
+  ms_ssim_ramp_steps: 500
+kl_schedule:
+  t0: 2000
+  t1: 20000
+  beta_max: 0.01
+optimizer:
+  name: adamw
+  lr: 0.0001
+  weight_decay: 0.0001
+scheduler:
+  name: cosine
+  warmup_steps: 500
+  min_lr: 0.000001
+precision:
+  amp_dtype: bf16
+memory:
+  gradient_checkpointing: true
+training:
+  max_steps: 100000
+  microbatch_size: 4
+  grad_accum: 2
+  grad_clip_norm: 1.0
+  ema_decay: 0.999
+  val_every_steps: 1000
+  log_every_steps: 50
+  candidate_steps: [20000, 40000, 60000, 80000, 100000]
+  overfit_n_patches: 16
+  num_workers: 4
+evaluation:
+  allow_test: false
+bootstrap:
+  n_resamples: 1000
+  seed: 0
+checkpoint:
+  save_every_steps: 2000
+  keep_last: 3
+seed_orchestration:
+  seeds: [0, 1, 2]
+gates:
+  overfit_loss_drop_frac: 0.9
+  min_active_unit_frac: 0.5
+logging:
+  level: INFO

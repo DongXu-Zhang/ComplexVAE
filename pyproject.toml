@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microscopy-vae"
+version = "0.1.0"
+description = "Scratch single-channel microscopy KL-VAE (HQ codec) — independent implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Microscopy VAE Project" }]
+dependencies = [
+  "numpy>=1.26,<2",
+  "pydantic>=2.5",
+  "PyYAML>=6.0",
+  "mrcfile>=1.5.0",
+  "tifffile>=2024.1.0",
+  "typing_extensions>=4.8",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.1.0"]
+dev = ["pytest>=8.0", "pytest-timeout>=2.2"]
+
+[project.scripts]
+microscopy-vae = "microscopy_vae.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "gpu: tests that require CUDA",
+  "slow: longer integration tests",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]

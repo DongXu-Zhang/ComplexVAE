@@ -1,0 +1,71 @@
+schema_version: microvae-config-v1
+experiment:
+  name: base
+  route: hq_codec
+  output_dir: runs/base
+  seed: 0
+data:
+  mode: synthetic
+  synthetic_n_groups: 4
+  synthetic_pages_per_group: 2
+  synthetic_size: 64
+normalization:
+  method: robust_linear_p0.1_p99.9
+  fit_split: train
+  clip: false          # linear-head codec: preserve negative HQ intensities and tails
+  ssim_data_range: 1.0 # reference scale for SSIM C1/C2 in the normalized domain
+crop:
+  size: 64
+  multi_scale_sizes: [64]
+  multi_scale_probs: [1.0]
+model:
+  in_channels: 1
+  out_channels: 1
+  latent_channels: 4
+  encoder_block_out_channels: [128, 256, 512, 512]
+  decoder_block_out_channels: [96, 192, 384, 384]
+  layers_per_block: 2
+  norm_num_groups: 32
+  mid_block_add_attention: true
+  output_activation: linear
+initialization:
+  mode: fresh_init
+task:
+  name: hq_codec
+  sample_posterior: true
+loss:
+  w_char: 1.0
+  w_ms_ssim: 0.1
+  w_grad: 0.05
+  w_flux: 0.01
+  free_nats: 0.5
+  ms_ssim_start_step: 1000
+kl_schedule:
+  t0: 2000
+  t1: 20000
+  beta_max: 0.01
+optimizer:
+  name: adamw
+  lr: 0.0001
+  weight_decay: 0.0001
+scheduler:
+  name: cosine
+  warmup_steps: 500
+  min_lr: 0.000001
+precision:
+  amp_dtype: fp32
+training:
+  max_steps: 100
+  microbatch_size: 2
+  grad_accum: 1
+  grad_clip_norm: 1.0
+  val_every_steps: 50
+  log_every_steps: 10
+  overfit_n_patches: 8
+  num_workers: 0
+evaluation:
+  allow_test: false
+logging:
+  level: INFO
+checkpoint:
+  keep_last: 3

@@ -1,0 +1,60 @@
+schema_version: microvae-config-v1
+experiment:
+  name: overfit_hq
+  route: hq_codec
+  output_dir: runs/overfit_hq
+  seed: 0
+  allow_existing_output: true
+data:
+  mode: synthetic
+  synthetic_n_groups: 2
+  synthetic_pages_per_group: 4
+  synthetic_size: 64
+normalization:
+  method: identity
+  fit_split: train
+  clip: false
+crop:
+  size: 64
+model:
+  in_channels: 1
+  out_channels: 1
+  latent_channels: 4
+  encoder_block_out_channels: [32, 64, 64]
+  decoder_block_out_channels: [32, 64, 64]
+  layers_per_block: 1
+  norm_num_groups: 8
+  mid_block_add_attention: false
+  output_activation: linear
+initialization:
+  mode: fresh_init
+task:
+  name: hq_codec
+loss:
+  w_char: 1.0
+  w_ms_ssim: 0.0
+  w_grad: 0.05
+  w_flux: 0.0
+  free_nats: 0.0
+  ms_ssim_start_step: 100000
+kl_schedule:
+  t0: 50
+  t1: 200
+  beta_max: 0.001
+optimizer:
+  lr: 0.002
+training:
+  max_steps: 300
+  microbatch_size: 4
+  grad_accum: 1
+  log_every_steps: 20
+  overfit_n_patches: 8
+  num_workers: 0
+precision:
+  amp_dtype: fp32
+gates:
+  overfit_loss_drop_frac: 0.5
+evaluation:
+  allow_test: false
+checkpoint:
+  keep_last: 3

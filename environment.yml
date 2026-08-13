@@ -1,0 +1,28 @@
+# Conda environment for ComplexVAE / microscopy-vae
+# Create:
+#   conda env create -f environment.yml
+#   conda activate complexvae
+#
+# GPU (CUDA 12.1 torch — match your cluster driver):
+#   After create, reinstall torch from pytorch channel if needed:
+#   conda install pytorch pytorch-cuda=12.1 -c pytorch -c nvidia
+name: complexvae
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.26.*
+  - pyyaml
+  - pip:
+      - pydantic>=2.5
+      - mrcfile>=1.5.0
+      - "tifffile>=2024.1.0"
+      - typing_extensions>=4.8
+      - pytest>=8.0
+      - pytest-timeout>=2.2
+      # Install torch separately for your CUDA version, e.g.:
+      #   pip install torch==2.1.1 --index-url https://download.pytorch.org/whl/cu121
+      # or CPU:
+      #   pip install torch --index-url https://download.pytorch.org/whl/cpu

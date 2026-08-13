@@ -1,0 +1,692 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from microscopy_vae import __version__
+from microscopy_vae.config.loader import dump_resolved
+from microscopy_vae.config.schema import RootConfig
+from microscopy_vae.config.validation import validate_for_training
+from microscopy_vae.data.hq_dataset import ManifestHQDataset, SyntheticHQDataset, collate_hq
+from microscopy_vae.data.manifest import load_hq_manifest, manifest_sha256, summarize_records
+from microscopy_vae.data.normalization import NormalizationState, Normalizer, fit_robust_normalizer
+from microscopy_vae.data.readers import read_page
+from microscopy_vae.data.samplers import HierarchicalIndexSampler
+from microscopy_vae.data.synthetic import build_synthetic_hq_pool
+from microscopy_vae.engine.checkpoint import CheckpointManager
+from microscopy_vae.engine.ema import EMA
+from microscopy_vae.engine.evaluator import evaluate_hq_loader
+from microscopy_vae.engine.schedulers import build_warmup_cosine_scheduler
+from microscopy_vae.engine.state import TrainerState
+from microscopy_vae.provenance.capture import write_environment
+from microscopy_vae.systems.factory import build_hq_codec_system
+from microscopy_vae.utils.logging import append_jsonl, setup_logging
+from microscopy_vae.utils.rng import seed_everything
+
+
+class Trainer:
+    """S1 HQ-codec trainer.
+
+    Load modes:
+    - fresh_init: default (ModelFactory)
+    - resume_exact: only via training.resume_exact_path (full state)
+    Never accepts a generic pretrained checkpoint for init.
+    """
+
+    def __init__(self, cfg: RootConfig) -> None:
+        validate_for_training(cfg)
+        if cfg.task.name != "hq_codec":
+            raise ValueError("S1 trainer only supports task.name=hq_codec")
+        if cfg.experiment.route != "hq_codec":
+            raise ValueError("S1 trainer only supports experiment.route=hq_codec")
+
+        self.cfg = cfg
+        self.logger = setup_logging(cfg.logging.level)
+        self.run_dir = Path(cfg.experiment.output_dir)
+        if self.run_dir.exists() and any(self.run_dir.iterdir()):
+            allow = bool(getattr(cfg.experiment, "allow_existing_output", False))
+            if cfg.training.resume_exact_path:
+                allow = True
+            if not allow:
+                raise FileExistsError(
+                    f"output_dir is non-empty: {self.run_dir}. "
+                    "Refuse to mix runs. Set experiment.allow_existing_output=true or use resume_exact_path."
+                )
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.config_sha = dump_resolved(cfg, self.run_dir / "resolved_config.yaml")
+        write_environment(self.run_dir / "environment.json")
+        seed_everything(cfg.experiment.seed, cfg.reproducibility.deterministic)
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.system = build_hq_codec_system(cfg).to(self.device)
+        self.state = TrainerState()
+        self.manifest_sha = "synthetic"
+        self._test_loader_built = False  # invariant
+
+        self._build_data_and_normalizer()
+        self._build_optim()
+        self.ckpt = CheckpointManager(self.run_dir)
+        self._grad_checked = False
+        self.ema: Optional[EMA] = None
+        if cfg.training.ema_decay is not None and cfg.training.ema_decay > 0:
+            self.ema = EMA(self.system.vae, decay=float(cfg.training.ema_decay))
+
+        # Optional resume_exact after optim built
+        if cfg.training.resume_exact_path:
+            self._resume_exact(Path(cfg.training.resume_exact_path))
+
+        # Prove no test loader attribute for training API
+        assert not hasattr(self, "test_loader")
+
+    def _build_data_and_normalizer(self) -> None:
+        cfg = self.cfg
+        mode = cfg.data.mode
+
+        self._norm_sources: Optional[List[str]] = None
+        if mode == "synthetic":
+            pages = build_synthetic_hq_pool(
+                n_groups=cfg.data.synthetic_n_groups,
+                pages_per_group=cfg.data.synthetic_pages_per_group,
+                size=max(cfg.data.synthetic_size, cfg.crop.size),
+                seed=cfg.experiment.seed,
+            )
+            train_pages = [p for p in pages if p.split == "train"]
+            train_imgs = [p.image for p in train_pages]
+            self._norm_sources = [p.source for p in train_pages]
+            self.manifest_sha = "synthetic"
+            self._pages_or_records = pages
+            train_cls = SyntheticHQDataset
+            val_cls = SyntheticHQDataset
+            train_arg = pages
+            val_arg = pages
+        elif mode == "hq_pool":
+            if not cfg.data.manifest_path:
+                raise ValueError("data.mode=hq_pool requires data.manifest_path")
+            mpath = Path(cfg.data.manifest_path)
+            # refuse_test=True: never return test rows
+            records = load_hq_manifest(mpath, allow_splits=("train", "val"), refuse_test=True)
+            # Optional Windows→Linux path prefix map (does not rewrite JSONL on disk)
+            if cfg.data.path_prefix_target:
+                from microscopy_vae.data.pathmap import PathPrefixMap, apply_prefix_map_to_records
+
+                src_pref = cfg.data.path_prefix_source or "F:\\Dataset"
+                pmap = PathPrefixMap(
+                    source_prefixes=(src_pref, src_pref.replace("\\", "/"), src_pref.replace("/", "\\")),
+                    target_root=cfg.data.path_prefix_target,
+                    require_exists=bool(cfg.data.path_require_exists),
+                )
+                records = apply_prefix_map_to_records(records, pmap)
+                self.logger.info(
+                    "Applied path prefix map %r -> %r (require_exists=%s)",
+                    src_pref,
+                    cfg.data.path_prefix_target,
+                    cfg.data.path_require_exists,
+                )
+            self.manifest_sha = manifest_sha256(mpath)
+            self.logger.info("Loaded HQ manifest: %s", summarize_records(records))
+            # Fit normalizer on train pages only (subsample for memory)
+            train_recs = [r for r in records if r.split == "train"]
+            reachable = [r for r in train_recs if Path(r.hq_path).is_file()]
+            if cfg.data.path_require_exists and len(reachable) < min(8, len(train_recs)):
+                raise FileNotFoundError(
+                    f"path_require_exists=true but only {len(reachable)}/{len(train_recs)} "
+                    f"train files are readable. Set data.path_prefix_target to the Linux mount "
+                    f"of F:\\Dataset (see data_fix STATUS)."
+                )
+            if reachable:
+                train_imgs, self._norm_sources = self._sample_train_images_for_norm(reachable)
+            elif cfg.normalization.method == "identity" or cfg.normalization.artifact_path:
+                # Structure-only dry path: no pixels yet; identity or pre-fit artifact required
+                import numpy as np
+
+                self.logger.warning(
+                    "No HQ files reachable on this host (%d train records). "
+                    "Using identity-range placeholder for normalizer fit. "
+                    "Real training requires mount/copy + path_prefix_target.",
+                    len(train_recs),
+                )
+                train_imgs = [np.array([[0.0, 1.0], [0.0, 1.0]], dtype=np.float32)]
+                self._norm_sources = ["placeholder"]
+            else:
+                raise FileNotFoundError(
+                    "HQ files not reachable and normalization.method is not identity. "
+                    "Either mount data and set path_prefix_target, or temporarily use "
+                    "normalization.method=identity only for non-training dry checks."
+                )
+            self._pages_or_records = records
+            train_cls = ManifestHQDataset
+            val_cls = ManifestHQDataset
+            train_arg = records
+            val_arg = records
+        elif mode == "paired_pool":
+            raise ValueError(
+                "paired_pool is not enabled in S1 HQ-only trainer. "
+                "Use hq_codec route first; paired routes require stage_transition after gates."
+            )
+        else:
+            raise ValueError(f"Unknown data.mode={mode}")
+
+        # Normalizer: load artifact / resume artifact, else fit train-only
+        if mode == "synthetic":
+            n_train_groups = len(
+                {p.group_id for p in self._pages_or_records if p.split == "train"}
+            )
+        else:
+            n_train_groups = len(
+                {r.group_id for r in self._pages_or_records if r.split == "train"}
+            )
+
+        existing_norm = self.run_dir / "normalizer.json"
+        if cfg.normalization.artifact_path and Path(cfg.normalization.artifact_path).is_file():
+            state = NormalizationState.load(Path(cfg.normalization.artifact_path))
+            self.normalizer_sha = state.save(self.run_dir / "normalizer.json")
+        elif cfg.training.resume_exact_path and existing_norm.is_file():
+            # resume: reuse the run's train-fitted normalizer (do not refit)
+            state = NormalizationState.load(existing_norm)
+            self.normalizer_sha = state.save(existing_norm)
+        else:
+            method = cfg.normalization.method
+            state = fit_robust_normalizer(
+                train_imgs,
+                method=method if method != "identity" else "identity",
+                clip=cfg.normalization.clip,
+                n_groups=n_train_groups,
+                config_sha256=self.config_sha,
+                manifest_sha256=self.manifest_sha,
+                sources=self._norm_sources,
+                fit_mode=getattr(cfg.normalization, "fit_mode", "source_balanced"),
+                max_pixels_per_page=getattr(cfg.normalization, "max_pixels_per_page", 65536),
+            )
+            self.normalizer_sha = state.save(self.run_dir / "normalizer.json")
+            self.logger.info(
+                "normalizer fit_mode=%s low=%.6g high=%.6g pages=%s",
+                state.fit_mode,
+                state.low,
+                state.high,
+                state.n_pages_fit,
+            )
+        self.normalizer = Normalizer(state)
+        if self.normalizer.state.fit_split != "train":
+            raise RuntimeError("Normalizer fit_split must be train")
+
+        self.train_set = train_cls(
+            train_arg,
+            split="train",
+            crop_size=cfg.crop.size,
+            normalizer=self.normalizer,
+            fixed_crops=False,
+            seed=cfg.experiment.seed,
+        )
+        self.val_set = val_cls(
+            val_arg,
+            split="val",
+            crop_size=cfg.crop.size,
+            normalizer=self.normalizer,
+            fixed_crops=True,
+            seed=cfg.experiment.seed + 1,
+        )
+
+        train_sampler = HierarchicalIndexSampler(
+            self.train_set.meta,
+            seed=cfg.experiment.seed,
+            source_weight_mode=cfg.sampling.source_weight_mode,
+            fixed_source_prior=cfg.sampling.fixed_source_prior,
+            epoch_length=max(len(self.train_set), cfg.training.microbatch_size),
+        )
+        self.train_sampler = train_sampler
+        pin = self.device.type == "cuda"
+        self.train_loader = DataLoader(
+            self.train_set,
+            batch_size=cfg.training.microbatch_size,
+            sampler=train_sampler,
+            shuffle=False,
+            num_workers=cfg.training.num_workers,
+            collate_fn=collate_hq,
+            drop_last=True,
+            pin_memory=pin,
+            persistent_workers=cfg.training.num_workers > 0,
+        )
+        self.val_loader = DataLoader(
+            self.val_set,
+            batch_size=cfg.training.microbatch_size,
+            shuffle=False,
+            num_workers=min(2, cfg.training.num_workers),
+            collate_fn=collate_hq,
+            pin_memory=pin,
+        )
+
+    def _sample_train_images_for_norm(
+        self, train_recs, max_pages: Optional[int] = None
+    ) -> tuple:
+        """Source-stratified page sample for normalizer fit. Returns (imgs, sources)."""
+        max_pages = max_pages or int(getattr(self.cfg.normalization, "max_pages_fit", 192))
+        rng = np.random.default_rng(self.cfg.experiment.seed)
+        by_src: Dict[str, List[Any]] = {}
+        for r in train_recs:
+            by_src.setdefault(str(r.source), []).append(r)
+        # equal budget per source
+        n_src = max(len(by_src), 1)
+        per = max(8, max_pages // n_src)
+        chosen = []
+        for s, rs in sorted(by_src.items()):
+            idxs = np.arange(len(rs))
+            if len(idxs) > per:
+                idxs = rng.choice(idxs, size=per, replace=False)
+            for i in idxs:
+                chosen.append(rs[int(i)])
+        imgs, sources = [], []
+        for r in chosen:
+            page, _ = read_page(r.hq_path, r.hq_page, expected_dtype=r.hq_dtype)
+            imgs.append(page)
+            sources.append(str(r.source))
+        if not imgs:
+            raise ValueError("No train images for normalizer fit")
+        return imgs, sources
+
+    def _build_optim(self) -> None:
+        cfg = self.cfg
+        self.optimizer = torch.optim.AdamW(
+            self.system.parameters(),
+            lr=cfg.optimizer.lr,
+            betas=cfg.optimizer.betas,
+            eps=cfg.optimizer.eps,
+            weight_decay=cfg.optimizer.weight_decay,
+        )
+        self.scheduler = build_warmup_cosine_scheduler(
+            self.optimizer,
+            warmup_steps=cfg.scheduler.warmup_steps,
+            max_steps=cfg.training.max_steps,
+            min_lr=cfg.scheduler.min_lr,
+            base_lr=cfg.optimizer.lr,
+        )
+        self.use_amp = cfg.precision.amp_dtype == "bf16" and self.device.type == "cuda"
+        self.scaler = None
+
+    def _resume_exact(self, path: Path) -> None:
+        self.logger.info("resume_exact from %s", path)
+        self.state, extra = CheckpointManager.resume_exact(
+            path,
+            model=self.system.vae,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+            expected_config_sha256=self.config_sha,
+            expected_normalizer_sha256=self.normalizer_sha,
+            map_location=str(self.device),
+            expected_code_version=None,  # warn-only: set if you need hard pin
+        )
+        if self.ema is not None and isinstance(extra, dict) and extra.get("ema"):
+            self.ema.load_state_dict(extra["ema"])
+
+    def _assert_finite_grads(self) -> None:
+        bad = []
+        for n, p in self.system.named_parameters():
+            if p.grad is None:
+                continue
+            if not torch.isfinite(p.grad).all():
+                bad.append(n)
+        if bad:
+            raise RuntimeError(f"Non-finite gradients in: {bad[:20]}")
+        critical_prefixes = ("vae.encoder", "vae.quant_conv", "vae.post_quant_conv", "vae.decoder")
+        missing = []
+        for pref in critical_prefixes:
+            has = any(
+                n.startswith(pref) and p.grad is not None and float(p.grad.detach().abs().sum()) > 0
+                for n, p in self.system.named_parameters()
+            )
+            if not has:
+                missing.append(pref)
+        if missing:
+            raise RuntimeError(f"Missing nonzero grads for: {missing}")
+
+    def _maybe_validate(self) -> Optional[Dict[str, Any]]:
+        use_ema = bool(getattr(self.cfg.evaluation, "use_ema_for_val", True)) and self.ema is not None
+        live_sd = None
+        if use_ema:
+            live_sd = {k: v.detach().cpu().clone() for k, v in self.system.vae.state_dict().items()}
+            self.ema.copy_to(self.system.vae)
+        boot_n = min(
+            int(getattr(self.cfg.evaluation, "max_bootstrap", 200)),
+            int(self.cfg.bootstrap.n_resamples),
+        )
+        metrics = evaluate_hq_loader(
+            self.system,
+            self.val_loader,
+            device=self.device,
+            use_posterior_mean=self.cfg.evaluation.use_posterior_mean,
+            bootstrap_n=boot_n,
+            bootstrap_seed=self.cfg.bootstrap.seed,
+            report_constant_baseline=bool(
+                getattr(self.cfg.evaluation, "report_constant_baseline", True)
+            ),
+        )
+        if use_ema and live_sd is not None:
+            self.system.vae.load_state_dict(live_sd)
+        rec = {
+            "step": self.state.optimizer_step,
+            "weights": "ema" if use_ema else "live",
+            "group_macro": metrics["group_macro"],
+            "by_source": metrics.get("by_source"),
+            "equal_source_macro": metrics.get("equal_source_macro"),
+            "constant_baseline": metrics.get("constant_baseline"),
+            "n_pages": metrics["n_pages"],
+            "n_groups": metrics["n_groups"],
+            "psnr_bootstrap": metrics["psnr_bootstrap"],
+        }
+        append_jsonl(self.run_dir / "metrics_val.jsonl", rec)
+        self.logger.info(
+            "val step=%s weights=%s group_macro_psnr=%.4f mae=%.6f by_source=%s",
+            self.state.optimizer_step,
+            rec["weights"],
+            metrics["group_macro"].get("psnr", float("nan")),
+            metrics["group_macro"].get("mae", float("nan")),
+            {k: v.get("psnr") for k, v in (metrics.get("by_source") or {}).items()},
+        )
+        # candidate step bookkeeping (pre-registered list only)
+        if self.state.optimizer_step in set(self.cfg.training.candidate_steps):
+            tag = f"candidate_step_{self.state.optimizer_step:07d}"
+            path = self.ckpt.save_exact(
+                tag=tag,
+                model=self.system.vae,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+                state=self.state,
+                config_sha256=self.config_sha,
+                normalizer_sha256=self.normalizer_sha,
+                code_version=__version__,
+                extra={"candidate": True, "val": rec},
+            )
+            self.state.candidate_hits[self.state.optimizer_step] = str(path)
+        return rec
+
+    def train(self, max_steps: Optional[int] = None) -> Dict[str, Any]:
+        max_steps = max_steps if max_steps is not None else self.cfg.training.max_steps
+        self.system.train()
+        it = iter(self.train_loader)
+        accum = self.cfg.training.grad_accum
+        self.optimizer.zero_grad(set_to_none=True)
+        history: List[float] = []
+
+        # Audit trainability at start of S1
+        audit = self.system.trainability_audit()
+        if not audit["all_core_trainable"]:
+            raise RuntimeError("S1 requires all core parameters trainable (fresh_init / unlocked)")
+
+        while self.state.optimizer_step < max_steps:
+            loss_accum = 0.0
+            last_diag: Dict[str, Any] = {}
+            for _micro in range(accum):
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    # new epoch: optional re-log sampler exposure
+                    it = iter(self.train_loader)
+                    batch = next(it)
+                batch.hq = batch.hq.to(self.device, non_blocking=True)
+                if self.use_amp:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        loss_out = self.system.task.forward_loss(
+                            batch, optimizer_step=self.state.optimizer_step
+                        )
+                        loss = loss_out.total / accum
+                    loss.backward()
+                else:
+                    loss_out = self.system.task.forward_loss(
+                        batch, optimizer_step=self.state.optimizer_step
+                    )
+                    loss = loss_out.total / accum
+                    loss.backward()
+                if not torch.isfinite(loss_out.total.detach()):
+                    raise RuntimeError(
+                        f"Non-finite loss at step {self.state.optimizer_step} "
+                        f"samples={batch.sample_ids} sources={batch.sources}"
+                    )
+                loss_accum += float(loss_out.total.detach().cpu())
+                last_diag = {
+                    k: float(v.detach().cpu()) if torch.is_tensor(v) and v.ndim == 0 else (
+                        v.detach().cpu().tolist() if torch.is_tensor(v) else v
+                    )
+                    for k, v in loss_out.diagnostics.items()
+                    if k
+                    in (
+                        "beta",
+                        "kl_mean",
+                        "active_unit_frac",
+                        "oor_hi_frac",
+                        "oor_lo_frac",
+                        "w_ms_ssim_effective",
+                    )
+                }
+                for name, t in loss_out.unweighted.items():
+                    last_diag[f"loss_raw_{name}"] = float(t.detach().cpu())
+                for name, t in loss_out.weighted.items():
+                    last_diag[f"loss_w_{name}"] = float(t.detach().cpu())
+                for name, w in loss_out.weights.items():
+                    last_diag[f"weight_{name}"] = float(w)
+                self.state.microbatch += 1
+                self.state.global_samples += batch.hq.shape[0]
+
+            pre_clip = float(
+                torch.nn.utils.clip_grad_norm_(
+                    self.system.parameters(),
+                    self.cfg.training.grad_clip_norm
+                    if self.cfg.training.grad_clip_norm > 0
+                    else 1e9,
+                )
+            )
+            if not self._grad_checked:
+                self._assert_finite_grads()
+                self._grad_checked = True
+            else:
+                # still check finite every step (cheap relative to forward)
+                for n, p in self.system.named_parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        raise RuntimeError(f"Non-finite grad at step {self.state.optimizer_step}: {n}")
+            self.optimizer.step()
+            self.scheduler.step()
+            if self.ema is not None:
+                self.ema.update(self.system.vae)
+            self.optimizer.zero_grad(set_to_none=True)
+            self.state.optimizer_step += 1
+            history.append(loss_accum / accum)
+
+            if self.state.optimizer_step % self.cfg.training.log_every_steps == 0:
+                rec = {
+                    "step": self.state.optimizer_step,
+                    "loss": history[-1],
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "grad_norm_pre_clip": pre_clip,
+                    "grad_clipped": pre_clip > float(self.cfg.training.grad_clip_norm or 0),
+                    **last_diag,
+                    "sampler_source_freq": self.train_sampler.realized_source_freq(),
+                    "sampler_planned_probs": self.train_sampler.planned_source_probs(),
+                }
+                append_jsonl(self.run_dir / "metrics_train.jsonl", rec)
+                self.logger.info(
+                    "step=%s loss=%.6f lr=%.2e grad_pre=%.4f",
+                    self.state.optimizer_step,
+                    history[-1],
+                    rec["lr"],
+                    pre_clip,
+                )
+
+            if (
+                self.cfg.training.val_every_steps > 0
+                and self.state.optimizer_step % self.cfg.training.val_every_steps == 0
+            ):
+                self._maybe_validate()
+                self.system.train()
+
+            if self.state.optimizer_step % self.cfg.checkpoint.save_every_steps == 0:
+                # avoid duplicate file when step is also a candidate step
+                if self.state.optimizer_step not in set(self.cfg.training.candidate_steps):
+                    self.ckpt.save_exact(
+                        tag=f"step_{self.state.optimizer_step:07d}",
+                        model=self.system.vae,
+                        optimizer=self.optimizer,
+                        scheduler=self.scheduler,
+                        scaler=self.scaler,
+                        state=self.state,
+                        config_sha256=self.config_sha,
+                        normalizer_sha256=self.normalizer_sha,
+                        code_version=__version__,
+                        extra={"ema": self.ema.state_dict() if self.ema else None},
+                    )
+                    self.ckpt.prune_periodic(keep_last=int(self.cfg.checkpoint.keep_last))
+
+        path = self.ckpt.save_exact(
+            tag=f"step_{self.state.optimizer_step:07d}_final",
+            model=self.system.vae,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+            state=self.state,
+            config_sha256=self.config_sha,
+            normalizer_sha256=self.normalizer_sha,
+            code_version=__version__,
+            extra={"ema": self.ema.state_dict() if self.ema else None},
+        )
+        return {
+            "final_step": self.state.optimizer_step,
+            "final_loss": history[-1] if history else None,
+            "checkpoint": str(path),
+            "loss_history": history,
+            "candidate_hits": dict(self.state.candidate_hits),
+            "sampler_source_freq": self.train_sampler.realized_source_freq(),
+        }
+
+    def _select_overfit_indices(self, n_target: int) -> List[int]:
+        """Cover all sources with >=2 groups each when possible (fixed crops)."""
+        meta = self.train_set.meta
+        by_src: Dict[str, Dict[str, List[int]]] = {}
+        for m in meta:
+            by_src.setdefault(m["source"], {}).setdefault(m["group_id"], []).append(m["index"])
+        chosen: List[int] = []
+        # at least 2 groups per source, up to 4 pages each
+        for src in sorted(by_src.keys()):
+            groups = sorted(by_src[src].keys())[: max(2, min(4, len(by_src[src])))]
+            for g in groups:
+                pages = by_src[src][g][:2]
+                chosen.extend(pages)
+        # fill remaining
+        if len(chosen) < n_target:
+            rest = [m["index"] for m in meta if m["index"] not in set(chosen)]
+            chosen.extend(rest[: n_target - len(chosen)])
+        return chosen[:n_target]
+
+    def overfit_small(self) -> Dict[str, Any]:
+        """Multi-source fixed-subset overfit; eval uses full subset + posterior mean."""
+        n = min(self.cfg.training.overfit_n_patches, len(self.train_set))
+        idxs = self._select_overfit_indices(n)
+        if hasattr(self.train_set, "fixed_crops"):
+            prev = self.train_set.fixed_crops
+            self.train_set.fixed_crops = True
+        else:
+            prev = None
+        subset = torch.utils.data.Subset(self.train_set, idxs)
+        loader = DataLoader(
+            subset,
+            batch_size=min(self.cfg.training.microbatch_size, max(len(idxs), 1)),
+            shuffle=True,
+            collate_fn=collate_hq,
+        )
+        eval_loader = DataLoader(
+            subset,
+            batch_size=min(self.cfg.training.microbatch_size, max(len(idxs), 1)),
+            shuffle=False,
+            collate_fn=collate_hq,
+        )
+
+        def _eval_mean() -> float:
+            self.system.eval()
+            total, count = 0.0, 0
+            with torch.no_grad():
+                for batch in eval_loader:
+                    batch.hq = batch.hq.to(self.device)
+                    # posterior mean recon vs target in normalized domain
+                    recon = self.system.reconstruct_hq(batch.hq)
+                    total += float((recon - batch.hq).abs().mean().cpu()) * batch.hq.shape[0]
+                    count += batch.hq.shape[0]
+            self.system.train()
+            return total / max(count, 1)
+
+        initial = _eval_mean()
+        self.system.train()
+        it = iter(loader)
+        losses: List[float] = []
+        max_steps = min(self.cfg.training.max_steps, 500)
+        # force sample_posterior False during overfit train for stability? keep True but fixed seed noise
+        self.optimizer.zero_grad(set_to_none=True)
+        g = torch.Generator(device="cpu")
+        g.manual_seed(self.cfg.experiment.seed)
+        for step in range(max_steps):
+            try:
+                batch = next(it)
+            except StopIteration:
+                it = iter(loader)
+                batch = next(it)
+            batch.hq = batch.hq.to(self.device)
+            loss_out = self.system.task.forward_loss(batch, optimizer_step=step)
+            if not torch.isfinite(loss_out.total.detach()):
+                raise RuntimeError(f"Non-finite overfit loss at step {step}")
+            loss_out.total.backward()
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            losses.append(float(loss_out.total.detach().cpu()))
+            self.state.optimizer_step = step + 1
+        final = _eval_mean()
+        if prev is not None:
+            self.train_set.fixed_crops = prev
+        drop = (initial - final) / max(abs(initial), 1e-8)
+        thr = float(self.cfg.gates.overfit_loss_drop_frac)
+        # NO silent 0.5: require configured relative drop on fixed-subset MAE
+        passed = drop >= thr
+        # coverage report
+        src_counts: Dict[str, int] = {}
+        for i in idxs:
+            s = self.train_set.meta[i]["source"]
+            src_counts[s] = src_counts.get(s, 0) + 1
+        return {
+            "initial_loss": float(initial),
+            "final_loss": float(final),
+            "drop_frac": float(drop),
+            "threshold": thr,
+            "passed": bool(passed),
+            "steps": len(losses),
+            "n_patches": len(idxs),
+            "sources_in_subset": src_counts,
+            "train_batch_loss_curve_head": losses[:5],
+            "train_batch_loss_curve_tail": losses[-5:],
+            "metric": "fixed_subset_mae_posterior_mean",
+        }
+
+    def dry_run(self) -> Dict[str, Any]:
+        params = self.system.vae.count_parameters()
+        audit = self.system.trainability_audit()
+        batch = next(iter(self.train_loader))
+        x = batch.hq[:1].to(self.device)
+        with torch.no_grad():
+            out = self.system.vae(x, sample_posterior=False)
+        return {
+            "params": params,
+            "all_core_trainable": audit["all_core_trainable"],
+            "input_shape": list(x.shape),
+            "recon_shape": list(out.reconstruction.shape),
+            "latent_shape": list(out.latent.shape),
+            "spatial_compression": self.system.vae.spatial_compression,
+            "config_sha256": self.config_sha,
+            "normalizer_sha256": self.normalizer_sha,
+            "manifest_sha256": self.manifest_sha,
+            "device": str(self.device),
+            "has_test_loader": hasattr(self, "test_loader"),
+            "capabilities": {
+                "hq_reconstruction": self.system.capabilities.hq_reconstruction,
+                "lr_encoding": self.system.capabilities.lr_encoding,
+                "paired_restoration": self.system.capabilities.paired_restoration,
+            },
+        }
