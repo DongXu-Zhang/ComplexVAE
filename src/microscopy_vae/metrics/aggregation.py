@@ -24,6 +24,26 @@ def page_to_group_macro(
     return {k: float(np.mean([gm[k] for gm in group_means])) for k in metric_keys}
 
 
+def volume_mse_pooled_psnr(
+    page_mses: Sequence[float],
+    group_ids: Sequence[str],
+    *,
+    data_range: float = 1.0,
+) -> float:
+    """Equal-weight volumes of PSNR(mean MSE in volume), not mean of PSNRs."""
+    buckets: Dict[str, List[float]] = defaultdict(list)
+    for mse, g in zip(page_mses, group_ids):
+        buckets[g].append(float(mse))
+    if not buckets:
+        return float("nan")
+    vals = []
+    for rows in buckets.values():
+        mse = float(np.mean(rows))
+        mse = max(mse, 1e-12)
+        vals.append(float(10.0 * np.log10((data_range**2) / mse)))
+    return float(np.mean(vals))
+
+
 def group_bootstrap_ci(
     group_values: Sequence[float],
     *,

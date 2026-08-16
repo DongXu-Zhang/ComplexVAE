@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -10,6 +10,57 @@ from microscopy_vae.data.normalization import Normalizer
 from microscopy_vae.data.readers import read_page
 from microscopy_vae.data.records import HQBatch, HQPageRecord
 from microscopy_vae.data.synthetic import SyntheticPage
+
+
+def take_crop(
+    img: np.ndarray,
+    idx: int,
+    *,
+    crop_size: int,
+    fixed: bool,
+    seed: int,
+    mode: str,
+    jitter_frac: float,
+    cell_hits: Dict[int, np.ndarray],
+    draw_counter: Callable[[], int],
+) -> np.ndarray:
+    h, w = img.shape
+    cs = crop_size
+    if h < cs or w < cs:
+        raise ValueError(f"image {h}x{w} smaller than crop {cs} for idx={idx}")
+    if fixed:
+        y0 = (h - cs) // 2
+        x0 = (w - cs) // 2
+        return img[y0 : y0 + cs, x0 : x0 + cs]
+    if mode != "coverage_jitter":
+        rng = np.random.default_rng(seed + idx * 9973)
+        y0 = int(rng.integers(0, h - cs + 1))
+        x0 = int(rng.integers(0, w - cs + 1))
+        return img[y0 : y0 + cs, x0 : x0 + cs]
+
+    ny = max(h // cs, 1)
+    nx = max(w // cs, 1)
+    hits = cell_hits.get(idx)
+    if hits is None or hits.shape != (ny, nx):
+        hits = np.zeros((ny, nx), dtype=np.int32)
+        cell_hits[idx] = hits
+    n_draw = draw_counter()
+    rng = np.random.default_rng(seed + idx * 9973 + n_draw * 17)
+    min_h = int(hits.min())
+    cands = np.argwhere(hits == min_h)
+    pick = cands[int(rng.integers(0, len(cands)))]
+    cy, cx = int(pick[0]), int(pick[1])
+    hits[cy, cx] += 1
+    base_y = int(round(cy * (h - cs) / max(ny - 1, 1))) if ny > 1 else 0
+    base_x = int(round(cx * (w - cs) / max(nx - 1, 1))) if nx > 1 else 0
+    jitter = int(round(cs * max(jitter_frac, 0.0)))
+    y_lo = max(0, base_y - jitter)
+    y_hi = min(h - cs, base_y + jitter)
+    x_lo = max(0, base_x - jitter)
+    x_hi = min(w - cs, base_x + jitter)
+    y0 = int(rng.integers(y_lo, y_hi + 1))
+    x0 = int(rng.integers(x_lo, x_hi + 1))
+    return img[y0 : y0 + cs, x0 : x0 + cs]
 
 
 class SyntheticHQDataset(Dataset):
@@ -24,6 +75,8 @@ class SyntheticHQDataset(Dataset):
         normalizer: Normalizer,
         fixed_crops: bool = False,
         seed: int = 0,
+        crop_mode: str = "random",
+        coverage_jitter_frac: float = 0.25,
     ) -> None:
         if split == "test":
             raise RuntimeError("Refuse to construct test dataset without freeze credentials")
@@ -34,6 +87,10 @@ class SyntheticHQDataset(Dataset):
         self.normalizer = normalizer
         self.fixed_crops = fixed_crops
         self.seed = seed
+        self.crop_mode = crop_mode
+        self.coverage_jitter_frac = float(coverage_jitter_frac)
+        self._cell_hits: Dict[int, np.ndarray] = {}
+        self._coverage_draws = 0
         # public metadata for hierarchical sampler
         self.meta = [
             {
@@ -49,18 +106,21 @@ class SyntheticHQDataset(Dataset):
         return len(self.pages)
 
     def _crop(self, img: np.ndarray, idx: int) -> np.ndarray:
-        h, w = img.shape
-        cs = self.crop_size
-        if h < cs or w < cs:
-            raise ValueError(f"image {h}x{w} smaller than crop {cs}")
-        if self.fixed_crops:
-            y0 = (h - cs) // 2
-            x0 = (w - cs) // 2
-        else:
-            rng = np.random.default_rng(self.seed + idx * 9973)
-            y0 = int(rng.integers(0, h - cs + 1))
-            x0 = int(rng.integers(0, w - cs + 1))
-        return img[y0 : y0 + cs, x0 : x0 + cs]
+        return take_crop(
+            img,
+            idx,
+            crop_size=self.crop_size,
+            fixed=self.fixed_crops,
+            seed=self.seed,
+            mode=self.crop_mode,
+            jitter_frac=self.coverage_jitter_frac,
+            cell_hits=self._cell_hits,
+            draw_counter=lambda: self._bump_coverage(),
+        )
+
+    def _bump_coverage(self) -> int:
+        self._coverage_draws += 1
+        return self._coverage_draws
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         p = self.pages[idx]
@@ -94,6 +154,8 @@ class ManifestHQDataset(Dataset):
         normalizer: Normalizer,
         fixed_crops: bool = False,
         seed: int = 0,
+        crop_mode: str = "random",
+        coverage_jitter_frac: float = 0.25,
     ) -> None:
         if split == "test":
             raise RuntimeError("Refuse to construct test dataset without freeze credentials")
@@ -107,6 +169,10 @@ class ManifestHQDataset(Dataset):
         self.normalizer = normalizer
         self.fixed_crops = fixed_crops
         self.seed = seed
+        self.crop_mode = crop_mode
+        self.coverage_jitter_frac = float(coverage_jitter_frac)
+        self._cell_hits: Dict[int, np.ndarray] = {}
+        self._coverage_draws = 0
         self.meta = [
             {
                 "source": r.source,
@@ -121,18 +187,21 @@ class ManifestHQDataset(Dataset):
         return len(self.records)
 
     def _crop(self, img: np.ndarray, idx: int) -> np.ndarray:
-        h, w = img.shape
-        cs = self.crop_size
-        if h < cs or w < cs:
-            raise ValueError(f"image {h}x{w} smaller than crop {cs} for sample idx={idx}")
-        if self.fixed_crops:
-            y0 = (h - cs) // 2
-            x0 = (w - cs) // 2
-        else:
-            rng = np.random.default_rng(self.seed + idx * 9973)
-            y0 = int(rng.integers(0, h - cs + 1))
-            x0 = int(rng.integers(0, w - cs + 1))
-        return img[y0 : y0 + cs, x0 : x0 + cs]
+        return take_crop(
+            img,
+            idx,
+            crop_size=self.crop_size,
+            fixed=self.fixed_crops,
+            seed=self.seed,
+            mode=self.crop_mode,
+            jitter_frac=self.coverage_jitter_frac,
+            cell_hits=self._cell_hits,
+            draw_counter=lambda: self._bump_coverage(),
+        )
+
+    def _bump_coverage(self) -> int:
+        self._coverage_draws += 1
+        return self._coverage_draws
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         r = self.records[idx]

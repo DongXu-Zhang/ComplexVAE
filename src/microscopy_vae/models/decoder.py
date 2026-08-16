@@ -21,6 +21,7 @@ class Decoder(nn.Module):
         layers_per_block: int = 2,
         norm_num_groups: int = 32,
         mid_block_add_attention: bool = True,
+        upsample_mode: str = "nearest",
     ) -> None:
         super().__init__()
         if out_channels != 1:
@@ -48,6 +49,7 @@ class Decoder(nn.Module):
                     num_layers=self.layers_per_up,
                     add_upsample=not is_final,
                     groups=norm_num_groups,
+                    upsample_mode=upsample_mode,
                 )
             )
             prev = cout

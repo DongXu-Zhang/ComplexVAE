@@ -25,6 +25,10 @@ class HierarchicalIndexSampler(Sampler[int]):
         source_weight_mode: str = "sqrt_groups",
         fixed_source_prior: Optional[Dict[str, float]] = None,
         epoch_length: Optional[int] = None,
+        slice_weight_mode: str = "uniform",
+        slice_scores: Optional[Dict[int, float]] = None,
+        focus_temperature: float = 0.7,
+        focus_min_keep: float = 0.15,
     ) -> None:
         if not meta:
             raise ValueError("empty meta for HierarchicalIndexSampler")
@@ -39,6 +43,11 @@ class HierarchicalIndexSampler(Sampler[int]):
         self.source_draws: Dict[str, int] = defaultdict(int)
         self._step = 0
         self.epoch_length = epoch_length if epoch_length is not None else len(meta)
+        self.slice_weight_mode = slice_weight_mode
+        self.slice_scores = dict(slice_scores or {})
+        self.focus_temperature = float(focus_temperature)
+        self.focus_min_keep = float(focus_min_keep)
+        self.focus_draws = 0
         # validate prior if requested
         if source_weight_mode == "fixed_prior":
             if not self.fixed_source_prior:
@@ -74,9 +83,25 @@ class HierarchicalIndexSampler(Sampler[int]):
         groups = list(self.by_source[source].keys())
         group = groups[int(rng.integers(0, len(groups)))]
         pages = self.by_source[source][group]
-        idx = pages[int(rng.integers(0, len(pages)))]
+        idx = pages[self._choose_slice(rng, pages)]
         self.exposure[group] += 1
         return idx
+
+    def _choose_slice(self, rng: np.random.Generator, pages: List[int]) -> int:
+        if self.slice_weight_mode != "focus_softmax" or len(pages) <= 1:
+            return int(rng.integers(0, len(pages)))
+        scores = np.array([float(self.slice_scores.get(i, 0.0)) for i in pages], dtype=np.float64)
+        if not np.isfinite(scores).all() or float(scores.max() - scores.min()) < 1e-12:
+            return int(rng.integers(0, len(pages)))
+        temp = max(self.focus_temperature, 1e-6)
+        z = (scores - scores.max()) / temp
+        sm = np.exp(z)
+        sm = sm / sm.sum()
+        keep = min(max(self.focus_min_keep, 0.0), 0.95)
+        p = (1.0 - keep) * sm + keep / len(pages)
+        p = p / p.sum()
+        self.focus_draws += 1
+        return int(rng.choice(len(pages), p=p))
 
     def __iter__(self) -> Iterator[int]:
         for _ in range(self.epoch_length):

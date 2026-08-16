@@ -54,6 +54,12 @@ class SamplingConfig(BaseModel):
     strategy: Literal["source_group_page"] = "source_group_page"
     source_weight_mode: Literal["sqrt_groups", "n_groups", "fixed_prior"] = "sqrt_groups"
     fixed_source_prior: Optional[Dict[str, float]] = None
+    # uniform: original. focus_softmax: upweight in-focus / structured slices inside a volume.
+    slice_weight_mode: Literal["uniform", "focus_softmax"] = "uniform"
+    focus_sidecar_path: Optional[str] = None
+    focus_temperature: float = 0.7
+    focus_min_keep: float = 0.15
+    focus_compute_if_missing: bool = False
 
 
 class CropConfig(BaseModel):
@@ -61,6 +67,9 @@ class CropConfig(BaseModel):
     size: int = 256
     multi_scale_sizes: List[int] = Field(default_factory=lambda: [256])
     multi_scale_probs: List[float] = Field(default_factory=lambda: [1.0])
+    # random: original. coverage_jitter: prefer unseen coarse cells, then jitter.
+    mode: Literal["random", "coverage_jitter"] = "random"
+    coverage_jitter_frac: float = 0.25
 
 
 class ModelConfig(BaseModel):
@@ -74,6 +83,9 @@ class ModelConfig(BaseModel):
     norm_num_groups: int = 32
     mid_block_add_attention: bool = True
     output_activation: Literal["linear"] = "linear"
+    upsample_mode: Literal["nearest", "bilinear"] = "nearest"
+    downsample_pad_mode: Literal["asymmetric", "symmetric"] = "asymmetric"
+    downsample_preblur: bool = False
     input_domain: str = "normalized_hq"
     output_domain: str = "normalized_hq"
     # Forbidden fields must stay absent or false
@@ -118,6 +130,13 @@ class LossConfig(BaseModel):
     charbonnier_eps: float = 1e-3
     ms_ssim_start_step: int = 1000
     ms_ssim_ramp_steps: int = 500
+    # v2: per-sample amplitude normalization of pixel/structure terms (not flux/KL).
+    amp_norm: bool = False
+    # extra weight on |∇target|-weighted Charbonnier; 0 keeps v1 behaviour.
+    edge_weight: float = 0.0
+    # high-pass residual Charbonnier; 0 keeps v1.
+    w_hf: float = 0.0
+    ssim_range_mode: Literal["fixed", "amp_space"] = "fixed"
 
 
 class KLScheduleConfig(BaseModel):
@@ -178,6 +197,7 @@ class EvaluationConfig(BaseModel):
     use_ema_for_val: bool = True
     report_constant_baseline: bool = True
     max_bootstrap: int = 200  # cap for wall-clock; full n_resamples only if smaller
+    extended_metrics: bool = False
 
 
 class BootstrapConfig(BaseModel):
@@ -190,6 +210,8 @@ class CheckpointConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     save_every_steps: int = 2000
     keep_last: int = 3
+    keep_best_snr: bool = True
+    keep_best_mae: bool = True
 
 
 class ReproConfig(BaseModel):

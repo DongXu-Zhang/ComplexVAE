@@ -23,6 +23,7 @@ from microscopy_vae.engine.evaluator import evaluate_hq_loader
 from microscopy_vae.engine.schedulers import build_warmup_cosine_scheduler
 from microscopy_vae.engine.state import TrainerState
 from microscopy_vae.provenance.capture import write_environment
+from microscopy_vae.provenance.source_tree import hash_source_tree
 from microscopy_vae.systems.factory import build_hq_codec_system
 from microscopy_vae.utils.logging import append_jsonl, setup_logging
 from microscopy_vae.utils.rng import seed_everything
@@ -59,6 +60,21 @@ class Trainer:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.config_sha = dump_resolved(cfg, self.run_dir / "resolved_config.yaml")
         write_environment(self.run_dir / "environment.json")
+        try:
+            pkg_root = Path(__file__).resolve().parents[1]
+            snap = hash_source_tree(pkg_root)
+            (self.run_dir / "source_snapshot.json").write_text(
+                __import__("json").dumps(
+                    {k: snap[k] for k in ("root", "n_files", "sha256")},
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.source_sha = str(snap["sha256"])
+        except Exception as exc:  # noqa: BLE001
+            self.source_sha = f"unavailable:{exc}"
         seed_everything(cfg.experiment.seed, cfg.reproducibility.deterministic)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -74,6 +90,8 @@ class Trainer:
         self.ema: Optional[EMA] = None
         if cfg.training.ema_decay is not None and cfg.training.ema_decay > 0:
             self.ema = EMA(self.system.vae, decay=float(cfg.training.ema_decay))
+        self.best_snr = float("-inf")
+        self.best_mae = float("inf")
 
         # Optional resume_exact after optim built
         if cfg.training.resume_exact_path:
@@ -213,6 +231,8 @@ class Trainer:
         if self.normalizer.state.fit_split != "train":
             raise RuntimeError("Normalizer fit_split must be train")
 
+        crop_mode = str(getattr(cfg.crop, "mode", "random"))
+        jitter = float(getattr(cfg.crop, "coverage_jitter_frac", 0.25))
         self.train_set = train_cls(
             train_arg,
             split="train",
@@ -220,6 +240,8 @@ class Trainer:
             normalizer=self.normalizer,
             fixed_crops=False,
             seed=cfg.experiment.seed,
+            crop_mode=crop_mode,
+            coverage_jitter_frac=jitter,
         )
         self.val_set = val_cls(
             val_arg,
@@ -228,7 +250,34 @@ class Trainer:
             normalizer=self.normalizer,
             fixed_crops=True,
             seed=cfg.experiment.seed + 1,
+            crop_mode="random",
+            coverage_jitter_frac=jitter,
         )
+
+        slice_scores: Dict[int, float] = {}
+        if str(getattr(cfg.sampling, "slice_weight_mode", "uniform")) == "focus_softmax":
+            if mode != "hq_pool":
+                self.logger.warning("focus_softmax ignored for mode=%s", mode)
+            else:
+                from microscopy_vae.data.focus_index import resolve_slice_scores
+
+                side = getattr(cfg.sampling, "focus_sidecar_path", None)
+                try:
+                    slice_scores = resolve_slice_scores(
+                        self.train_set.records,  # type: ignore[attr-defined]
+                        sidecar_path=Path(side) if side else None,
+                        compute_if_missing=bool(getattr(cfg.sampling, "focus_compute_if_missing", False)),
+                        cache_path=self.run_dir / "focus_sidecar_train.jsonl",
+                        logger=self.logger,
+                    )
+                    self.logger.info(
+                        "focus scores attached to %s/%s train slices",
+                        len(slice_scores),
+                        len(self.train_set),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("focus scoring failed (%s); falling back to uniform slices", exc)
+                    slice_scores = {}
 
         train_sampler = HierarchicalIndexSampler(
             self.train_set.meta,
@@ -236,6 +285,10 @@ class Trainer:
             source_weight_mode=cfg.sampling.source_weight_mode,
             fixed_source_prior=cfg.sampling.fixed_source_prior,
             epoch_length=max(len(self.train_set), cfg.training.microbatch_size),
+            slice_weight_mode=str(getattr(cfg.sampling, "slice_weight_mode", "uniform")),
+            slice_scores=slice_scores,
+            focus_temperature=float(getattr(cfg.sampling, "focus_temperature", 0.7)),
+            focus_min_keep=float(getattr(cfg.sampling, "focus_min_keep", 0.15)),
         )
         self.train_sampler = train_sampler
         pin = self.device.type == "cuda"
@@ -363,6 +416,7 @@ class Trainer:
             report_constant_baseline=bool(
                 getattr(self.cfg.evaluation, "report_constant_baseline", True)
             ),
+            extended_metrics=bool(getattr(self.cfg.evaluation, "extended_metrics", False)),
         )
         if use_ema and live_sd is not None:
             self.system.vae.load_state_dict(live_sd)
@@ -379,13 +433,16 @@ class Trainer:
         }
         append_jsonl(self.run_dir / "metrics_val.jsonl", rec)
         self.logger.info(
-            "val step=%s weights=%s group_macro_psnr=%.4f mae=%.6f by_source=%s",
+            "val step=%s weights=%s group_macro_psnr=%.4f mae=%.6f snr=%.4f pooled=%.4f by_source=%s",
             self.state.optimizer_step,
             rec["weights"],
             metrics["group_macro"].get("psnr", float("nan")),
             metrics["group_macro"].get("mae", float("nan")),
+            metrics["group_macro"].get("snr_db", float("nan")),
+            metrics["group_macro"].get("psnr_mse_pooled", float("nan")),
             {k: v.get("psnr") for k, v in (metrics.get("by_source") or {}).items()},
         )
+        self._maybe_save_best(metrics, rec)
         # candidate step bookkeeping (pre-registered list only)
         if self.state.optimizer_step in set(self.cfg.training.candidate_steps):
             tag = f"candidate_step_{self.state.optimizer_step:07d}"
@@ -399,10 +456,59 @@ class Trainer:
                 config_sha256=self.config_sha,
                 normalizer_sha256=self.normalizer_sha,
                 code_version=__version__,
-                extra={"candidate": True, "val": rec},
+                extra={"candidate": True, "val": rec, "ema": self.ema.state_dict() if self.ema else None},
             )
             self.state.candidate_hits[self.state.optimizer_step] = str(path)
         return rec
+
+    def _maybe_save_best(self, metrics: Dict[str, Any], rec: Dict[str, Any]) -> None:
+        gm = metrics.get("group_macro") or {}
+        mae_v = gm.get("mae")
+        snr_v = gm.get("snr_db")
+        if snr_v is None or not np.isfinite(snr_v):
+            # fall back to range-1 PSNR if extended metrics off
+            snr_v = gm.get("psnr")
+        ema_sd = self.ema.state_dict() if self.ema else None
+        if (
+            getattr(self.cfg.checkpoint, "keep_best_snr", True)
+            and snr_v is not None
+            and np.isfinite(snr_v)
+            and float(snr_v) > self.best_snr
+        ):
+            self.best_snr = float(snr_v)
+            self.ckpt.save_exact(
+                tag="best_snr",
+                model=self.system.vae,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+                state=self.state,
+                config_sha256=self.config_sha,
+                normalizer_sha256=self.normalizer_sha,
+                code_version=__version__,
+                extra={"kind": "best_snr", "val": rec, "ema": ema_sd, "source_sha": getattr(self, "source_sha", "")},
+            )
+            self.logger.info("new best SNR/PSNR-proxy=%.4f at step %s", self.best_snr, self.state.optimizer_step)
+        if (
+            getattr(self.cfg.checkpoint, "keep_best_mae", True)
+            and mae_v is not None
+            and np.isfinite(mae_v)
+            and float(mae_v) < self.best_mae
+        ):
+            self.best_mae = float(mae_v)
+            self.ckpt.save_exact(
+                tag="best_mae",
+                model=self.system.vae,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+                state=self.state,
+                config_sha256=self.config_sha,
+                normalizer_sha256=self.normalizer_sha,
+                code_version=__version__,
+                extra={"kind": "best_mae", "val": rec, "ema": ema_sd, "source_sha": getattr(self, "source_sha", "")},
+            )
+            self.logger.info("new best MAE=%.6f at step %s", self.best_mae, self.state.optimizer_step)
 
     def train(self, max_steps: Optional[int] = None) -> Dict[str, Any]:
         max_steps = max_steps if max_steps is not None else self.cfg.training.max_steps

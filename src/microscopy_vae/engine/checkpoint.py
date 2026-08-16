@@ -81,7 +81,9 @@ class CheckpointManager:
             [
                 p
                 for p in self.ckpt_dir.glob(f"{prefix}*.pt")
-                if "candidate" not in p.name and "final" not in p.name
+                if "candidate" not in p.name
+                and "final" not in p.name
+                and not p.name.startswith("best_")
             ],
             key=lambda p: p.stat().st_mtime,
         )

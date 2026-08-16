@@ -22,6 +22,8 @@ class Encoder(nn.Module):
         norm_num_groups: int = 32,
         mid_block_add_attention: bool = True,
         double_z: bool = True,
+        downsample_pad_mode: str = "asymmetric",
+        downsample_preblur: bool = False,
     ) -> None:
         super().__init__()
         if in_channels != 1:
@@ -43,6 +45,8 @@ class Encoder(nn.Module):
                     num_layers=layers_per_block,
                     add_downsample=not is_final,
                     groups=norm_num_groups,
+                    downsample_pad_mode=downsample_pad_mode,
+                    downsample_preblur=downsample_preblur,
                 )
             )
         self.down_blocks = nn.ModuleList(downs)

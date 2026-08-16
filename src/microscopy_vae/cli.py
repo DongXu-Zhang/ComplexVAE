@@ -190,6 +190,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         use_posterior_mean=cfg.evaluation.use_posterior_mean,
         bootstrap_n=cfg.bootstrap.n_resamples,
         bootstrap_seed=cfg.bootstrap.seed,
+        extended_metrics=bool(getattr(cfg.evaluation, "extended_metrics", False)),
     )
     # drop heavy page list for stdout unless --full
     if not args.full:
@@ -321,6 +322,29 @@ def cmd_export_weights(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_focus_sidecar(args: argparse.Namespace) -> int:
+    cfg = _cfg(args)
+    if cfg.data.mode != "hq_pool" or not cfg.data.manifest_path:
+        raise SystemExit("build-focus-sidecar requires data.mode=hq_pool and manifest_path")
+    from microscopy_vae.data.focus_index import build_focus_sidecar
+    from microscopy_vae.data.manifest import load_hq_manifest
+    from microscopy_vae.data.pathmap import PathPrefixMap, apply_prefix_map_to_records
+
+    recs = load_hq_manifest(Path(cfg.data.manifest_path), allow_splits=("train", "val"), refuse_test=True)
+    if cfg.data.path_prefix_target:
+        src_pref = cfg.data.path_prefix_source or "F:\\Dataset"
+        pmap = PathPrefixMap(
+            source_prefixes=(src_pref, src_pref.replace("\\", "/"), src_pref.replace("/", "\\")),
+            target_root=cfg.data.path_prefix_target,
+            require_exists=bool(cfg.data.path_require_exists),
+        )
+        recs = apply_prefix_map_to_records(recs, pmap)
+    out = Path(args.out)
+    build_focus_sidecar(recs, out, refuse_test=True)
+    print(f"Wrote {out}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="microscopy-vae", description="Scratch microscopy VAE CLI")
     sub = p.add_subparsers(dest="command", required=True)
@@ -340,6 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
         "freeze-candidate",
         "launch-seeds",
         "aggregate-seeds",
+        "build-focus-sidecar",
     ]:
         sp = sub.add_parser(name)
         _add_common(sp)
@@ -364,6 +389,8 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "export-weights":
             sp.add_argument("--weights", type=str, default=None)
             sp.add_argument("--out", type=str, default="exported_vae.pt")
+        if name == "build-focus-sidecar":
+            sp.add_argument("--out", type=str, default="focus_sidecar.jsonl")
     return p
 
 
@@ -382,6 +409,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "infer": cmd_infer,
         "export-latent-spec": cmd_export_latent_spec,
         "export-weights": cmd_export_weights,
+        "build-focus-sidecar": cmd_build_focus_sidecar,
     }
     if args.command not in dispatch:
         print(

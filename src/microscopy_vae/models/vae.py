@@ -36,6 +36,9 @@ class MicroscopyVAE(nn.Module):
         norm_num_groups: int = 32,
         mid_block_add_attention: bool = True,
         output_activation: str = "linear",
+        upsample_mode: str = "nearest",
+        downsample_pad_mode: str = "asymmetric",
+        downsample_preblur: bool = False,
     ) -> None:
         super().__init__()
         if in_channels != 1 or out_channels != 1:
@@ -47,6 +50,8 @@ class MicroscopyVAE(nn.Module):
             )
         self.latent_channels = latent_channels
         self.output_activation = output_activation
+        self.upsample_mode = upsample_mode
+        self.downsample_pad_mode = downsample_pad_mode
         self.encoder = Encoder(
             in_channels=in_channels,
             latent_channels=latent_channels,
@@ -55,6 +60,8 @@ class MicroscopyVAE(nn.Module):
             norm_num_groups=norm_num_groups,
             mid_block_add_attention=mid_block_add_attention,
             double_z=True,
+            downsample_pad_mode=downsample_pad_mode,
+            downsample_preblur=downsample_preblur,
         )
         self.decoder = Decoder(
             out_channels=out_channels,
@@ -63,6 +70,7 @@ class MicroscopyVAE(nn.Module):
             layers_per_block=layers_per_block,
             norm_num_groups=norm_num_groups,
             mid_block_add_attention=mid_block_add_attention,
+            upsample_mode=upsample_mode,
         )
         if self.encoder.spatial_compression != self.decoder.spatial_compression:
             raise ValueError("Encoder/Decoder spatial compression mismatch")

@@ -84,27 +84,63 @@ class AttentionBlock2D(nn.Module):
 
 
 class Downsample2D(nn.Module):
-    """Stride-2 conv downsample (Diffusers Downsample2D with padding=0 + pad)."""
+    """Stride-2 conv downsample.
 
-    def __init__(self, channels: int) -> None:
+    pad_mode='asymmetric' matches Diffusers (right/bottom +1) for even sizes.
+    pad_mode='symmetric' uses reflect pad; preferred for from-scratch microscopy
+    to reduce directional phase bias. Optional binomial preblur reduces aliasing
+    that can later appear as 2^n decoder stripes.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        pad_mode: str = "asymmetric",
+        preblur: bool = False,
+    ) -> None:
         super().__init__()
+        if pad_mode not in {"asymmetric", "symmetric"}:
+            raise ValueError(f"Unknown downsample pad_mode={pad_mode}")
+        self.pad_mode = pad_mode
+        self.preblur = bool(preblur)
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=0)
+        if self.preblur:
+            k = torch.tensor([1.0, 2.0, 1.0])
+            k2 = (k[:, None] * k[None, :])
+            k2 = k2 / k2.sum()
+            self.register_buffer(
+                "blur_kernel",
+                k2.view(1, 1, 3, 3).repeat(channels, 1, 1, 1),
+                persistent=False,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Match Diffusers asymmetric pad for even spatial sizes.
-        x = F.pad(x, (0, 1, 0, 1))
+        if self.preblur:
+            x = F.pad(x, (1, 1, 1, 1), mode="reflect")
+            x = F.conv2d(x, self.blur_kernel, groups=x.shape[1])
+        if self.pad_mode == "asymmetric":
+            x = F.pad(x, (0, 1, 0, 1))
+        else:
+            x = F.pad(x, (1, 1, 1, 1), mode="reflect")
         return self.conv(x)
 
 
 class Upsample2D(nn.Module):
-    """Nearest upsample + conv (avoids transposed-conv checkerboard)."""
+    """2× upsample + 3×3 conv. bilinear reduces nearest-neighbor grid stripes."""
 
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, *, mode: str = "nearest") -> None:
         super().__init__()
+        if mode not in {"nearest", "bilinear"}:
+            raise ValueError(f"Unknown upsample mode={mode}")
+        self.mode = mode
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        if self.mode == "nearest":
+            x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        else:
+            x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
         return self.conv(x)
 
 
@@ -118,6 +154,8 @@ class DownEncoderBlock2D(nn.Module):
         add_downsample: bool = True,
         groups: int = 32,
         eps: float = 1e-6,
+        downsample_pad_mode: str = "asymmetric",
+        downsample_preblur: bool = False,
     ) -> None:
         super().__init__()
         layers = []
@@ -125,7 +163,19 @@ class DownEncoderBlock2D(nn.Module):
             cin = in_channels if i == 0 else out_channels
             layers.append(ResnetBlock2D(cin, out_channels, eps=eps, groups=groups))
         self.resnets = nn.ModuleList(layers)
-        self.downsamplers = nn.ModuleList([Downsample2D(out_channels)]) if add_downsample else nn.ModuleList()
+        self.downsamplers = (
+            nn.ModuleList(
+                [
+                    Downsample2D(
+                        out_channels,
+                        pad_mode=downsample_pad_mode,
+                        preblur=downsample_preblur,
+                    )
+                ]
+            )
+            if add_downsample
+            else nn.ModuleList()
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.resnets:
@@ -145,6 +195,7 @@ class UpDecoderBlock2D(nn.Module):
         add_upsample: bool = True,
         groups: int = 32,
         eps: float = 1e-6,
+        upsample_mode: str = "nearest",
     ) -> None:
         super().__init__()
         layers = []
@@ -152,7 +203,11 @@ class UpDecoderBlock2D(nn.Module):
             cin = in_channels if i == 0 else out_channels
             layers.append(ResnetBlock2D(cin, out_channels, eps=eps, groups=groups))
         self.resnets = nn.ModuleList(layers)
-        self.upsamplers = nn.ModuleList([Upsample2D(out_channels)]) if add_upsample else nn.ModuleList()
+        self.upsamplers = (
+            nn.ModuleList([Upsample2D(out_channels, mode=upsample_mode)])
+            if add_upsample
+            else nn.ModuleList()
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.resnets:

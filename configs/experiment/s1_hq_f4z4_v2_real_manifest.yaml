@@ -1,0 +1,67 @@
+# Server overlay for v2. Set path_prefix_target + manifest_path on the training host.
+schema_version: microvae-config-v1
+experiment:
+  name: s1_hq_f4z4_v2_real
+  route: hq_codec
+  output_dir: runs/s1_hq_f4z4_v2_real
+  seed: 0
+  notes: "v2 real-manifest; refuse test"
+data:
+  mode: hq_pool
+  manifest_path: null
+  allow_splits: [train, val]
+  path_prefix_source: "F:\\Dataset"
+  path_prefix_target: null
+  path_require_exists: false
+normalization:
+  method: robust_linear_p0.1_p99.9
+  fit_split: train
+  clip: false
+  fit_mode: source_balanced
+sampling:
+  slice_weight_mode: focus_softmax
+  focus_compute_if_missing: true
+crop:
+  size: 256
+  mode: coverage_jitter
+model:
+  latent_channels: 4
+  encoder_block_out_channels: [128, 256, 512]
+  decoder_block_out_channels: [96, 192, 384]
+  upsample_mode: bilinear
+  downsample_pad_mode: symmetric
+  downsample_preblur: true
+initialization:
+  mode: fresh_init
+task:
+  name: hq_codec
+loss:
+  amp_norm: true
+  edge_weight: 0.75
+  w_hf: 0.05
+  w_grad: 0.08
+  w_ms_ssim: 0.12
+  ssim_range_mode: amp_space
+kl_schedule:
+  beta_max: 0.008
+  t1: 25000
+optimizer:
+  lr: 0.00008
+scheduler:
+  warmup_steps: 1000
+precision:
+  amp_dtype: bf16
+memory:
+  gradient_checkpointing: true
+training:
+  max_steps: 150000
+  microbatch_size: 4
+  grad_accum: 2
+  candidate_steps: [30000, 60000, 90000, 120000, 150000]
+  num_workers: 4
+evaluation:
+  allow_test: false
+  extended_metrics: true
+checkpoint:
+  keep_best_snr: true
+  keep_best_mae: true

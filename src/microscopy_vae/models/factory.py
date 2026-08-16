@@ -33,6 +33,9 @@ class ModelFactory:
         norm_num_groups: int = 32,
         mid_block_add_attention: bool = True,
         output_activation: str = "linear",
+        upsample_mode: str = "nearest",
+        downsample_pad_mode: str = "asymmetric",
+        downsample_preblur: bool = False,
         pretrained: Any = None,
         init_from: Any = None,
         checkpoint: Any = None,
@@ -61,6 +64,9 @@ class ModelFactory:
             norm_num_groups=norm_num_groups,
             mid_block_add_attention=mid_block_add_attention,
             output_activation=output_activation,
+            upsample_mode=upsample_mode,
+            downsample_pad_mode=downsample_pad_mode,
+            downsample_preblur=downsample_preblur,
         )
         init_module_kaiming(model)
         assert_no_nan_params(model)
@@ -88,6 +94,9 @@ class ModelFactory:
             norm_num_groups=int(model_cfg.get("norm_num_groups", 32)),
             mid_block_add_attention=bool(model_cfg.get("mid_block_add_attention", True)),
             output_activation=str(model_cfg.get("output_activation", "linear")),
+            upsample_mode=str(model_cfg.get("upsample_mode", "nearest")),
+            downsample_pad_mode=str(model_cfg.get("downsample_pad_mode", "asymmetric")),
+            downsample_preblur=bool(model_cfg.get("downsample_preblur", False)),
         )
 
 

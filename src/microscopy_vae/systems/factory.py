@@ -16,6 +16,9 @@ def build_hq_codec_system(cfg: RootConfig) -> HQCodecSystem:
         norm_num_groups=cfg.model.norm_num_groups,
         mid_block_add_attention=cfg.model.mid_block_add_attention,
         output_activation=cfg.model.output_activation,
+        upsample_mode=getattr(cfg.model, "upsample_mode", "nearest"),
+        downsample_pad_mode=getattr(cfg.model, "downsample_pad_mode", "asymmetric"),
+        downsample_preblur=bool(getattr(cfg.model, "downsample_preblur", False)),
     )
     if cfg.memory.gradient_checkpointing:
         vae.encoder.gradient_checkpointing = True
@@ -33,6 +36,10 @@ def build_hq_codec_system(cfg: RootConfig) -> HQCodecSystem:
         ms_ssim_ramp_steps=getattr(cfg.loss, "ms_ssim_ramp_steps", 500),
         charbonnier_eps=cfg.loss.charbonnier_eps,
         ssim_data_range=cfg.normalization.ssim_data_range,
+        amp_norm=bool(getattr(cfg.loss, "amp_norm", False)),
+        edge_weight=float(getattr(cfg.loss, "edge_weight", 0.0)),
+        w_hf=float(getattr(cfg.loss, "w_hf", 0.0)),
+        ssim_range_mode=str(getattr(cfg.loss, "ssim_range_mode", "fixed")),
     )
     task = HQCodecTask(vae, loss, sample_posterior=cfg.task.sample_posterior)
     return HQCodecSystem(vae, task)
