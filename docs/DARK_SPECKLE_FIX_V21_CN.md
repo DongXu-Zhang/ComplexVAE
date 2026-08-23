@@ -1,50 +1,49 @@
-# 暗背景白点：代码已改（v2.1），以及做不到的事
+# 白点问题：改判断之后的做法（v2.1）
 
-## 先说清楚「完美解决」的边界
+## 你说得对的地方
 
-**4×4 小格子不会从几何上消失。** 当前主模型仍是 f4：一个 latent 格对应 4×4 像素。这不是 bug，是压缩本身。  
-这次改的是把黑背景里的噪点**过度放大成满屏白块**的那几条路径。格子还在，但不该再被损失和采样当成「必须拟合的亮点」。
+不能靠「再加一项损失」去堵黑色背景。灰色、深色平坦区会出同样的事，损失会没完没了。
 
-必须**重新训练**（或至少从 v2 checkpoint 起用新损失微调）。**旧权重 + 新损失不能叫已经修好显示结果。**
+第一版（f8/z4，100k）**没有这类噪点**。所以不是「VAE 天生会在暗处造点」，而是 **v2 中间新加的东西** 把问题引进来了。
 
-下一轮请用：
+## 中间到底加了什么（和 v1 比）
 
-```text
-configs/experiment/s1_hq_f4z4_v2_1.yaml
-```
+v2 相对 v1，损失上多了三件关键的事：
 
-不要再用会放大空 patch 的 `s1_hq_f4z4_v2.yaml` 当主训练。
+1. **amp_norm**：每个 256 小块按自己的明暗范围去除。几乎全黑/全灰的块范围很小，误差会被放大很多倍（下限 0.05 时最多约 20 倍）。孤立噪点变成「必须拟合的结构」。灰色平坦块一样会被放大，不只是黑色。
+2. **edge_weight 无上限**：平坦区里一两个噪点梯度远高于平均值，像素权重可以极大。
+3. **高频损失**：高通之后，尖点还是尖点，继续奖励去拟合噪声。
 
----
+结构上 v2 还把压缩从 f8 改成 f4：格子更细、更能把噪声「装进去」。v1 的 f8 更容易把孤立点抹掉。但 **v1 没噪点，首先是因为损失没有逼模型去拟合这些点**。
 
-## 改了什么
+上一版 v2.1 又加了「暗区假阳性损失」，这正是你反对的路：堵黑色，堵不了灰色。已经从正式配方里拿掉。
 
-| 问题 | v2（出白点） | v2.1 |
-|---|---|---|
-| 空黑图被 `s=max(range,0.05)` 最多放大 20 倍 | 是 | 动态范围 < 0.08 时 **不再放大**（除数改回 1.0）；有结构时下限改为 0.20 |
-| 边缘权重无上限，孤立噪点权可以极大 | 是 | **clip 到 3** |
-| 高频项继续奖励暗区砂 | 0.05 | **0.02** |
-| Flux 管不住「背景假亮」 | 只有全图均值 | 增加 **暗区假阳性损失**：只罚「原图暗、重建更亮」 |
-| coverage 仍可能裁到纯黑 | 是 | 训练 crop 若稳健幅度 < 0.08，**最多再试 8 次** |
+## 现在的正式配方
 
-没有：逐 patch min-max、负值清零、GAN、转置卷积。
+**`configs/experiment/s1_hq_f4z4_v2_1.yaml`**
 
----
+| 保留（v2 结构，针对细丝/条纹/覆盖） | 撤回（回到 v1 损失） |
+|---|---|
+| f4、bilinear 上采样 | **关掉 amp_norm** |
+| coverage crop、focus slice | **edge_weight = 0** |
+| 全局 low/high，不逐块 min-max | **高频损失 = 0** |
+| | 不多加暗区损失 |
+| | Charbonnier / MS-SSIM / Scharr / Flux / KL 的权重与 v1 相同 |
 
-## 服务器怎么跑
+一句话：结构还用 v2，**损失退回第一版那套**。
 
-和 v2 一样，只换配置名和输出目录：
+必须重新训练。旧 v2 权重是在错误损失下学出来的。
+
+## 服务器
 
 ```bash
-export PYTHONPATH=$PWD/src
+git pull   # 应看到撤回 amp_norm 的 v2.1 配置
+
 python -m microscopy_vae.cli train \
   --config configs/experiment/s1_hq_f4z4_v2_1.yaml \
-  --override data.manifest_path=/data/zhangdongxu/VAE/manifests/hq_manifest_v2.jsonl \
-  --override data.path_prefix_source='F:\\Dataset' \
-  --override data.path_prefix_target=/data/zhangdongxu/VAE/raw/Dataset \
-  --override data.path_require_exists=true \
-  --override sampling.focus_sidecar_path=/data/zhangdongxu/VAE/manifests/focus_sidecar_v1.jsonl \
-  --override experiment.output_dir=/data/zhangdongxu/VAE/outputs/ComplexVAE/s1_hq_f4z4_v2_1_seed0
+  ...路径 override 与上次相同... \
+  --override experiment.output_dir=.../s1_hq_f4z4_v2_1_seed0
 ```
 
-看结果时除了 PSNR，请看暗区是否还成片冒白点。若只剩很淡的 4 像素网格、不再像满天星，诱因就算压住了。
+若这轮暗区干净了，就坐实是那三项新损失的问题。  
+若仍有明显 4 像素方块，再单独讨论 f4 格子，**仍然不要靠加损失去涂掉**。

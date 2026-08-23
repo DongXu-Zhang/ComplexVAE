@@ -1,12 +1,17 @@
-# S1 v2.1: same f4/z4 architecture as v2, but stops amplifying empty dark patches.
-# Use this for the next training run. Keep s1_hq_f4z4_v2.yaml as the artifact-causing control.
+# S1 v2.1 — same f4 architecture as v2, but v1 loss family.
+#
+# Why: v1 (f8/z4, 100k) did not produce dark-background speckle.
+# v2 added amp_norm, unbounded edge weights, and HF loss. Those terms
+# over-fit isolated noise on any low-contrast patch (black, grey, or dim).
+# Stacking more losses (dark-FP etc.) cannot cover every dark shade.
+# Revert the new loss extras; keep f4 + bilinear + sampling.
 schema_version: microvae-config-v1
 experiment:
   name: s1_hq_f4z4_v2_1
   route: hq_codec
   output_dir: runs/s1_hq_f4z4_v2_1
   seed: 0
-  notes: "v2.1: no amp on empty crops, edge clip, dark false-positive loss, retry low-range crops"
+  notes: "v2.1: f4/bilinear/coverage, but v1 losses (no amp_norm, no edge weight, no HF)"
   allow_existing_output: false
 data:
   mode: hq_pool
@@ -35,8 +40,8 @@ crop:
   size: 256
   mode: coverage_jitter
   coverage_jitter_frac: 0.25
-  min_robust_range: 0.08
-  max_range_retries: 8
+  min_robust_range: 0.0
+  max_range_retries: 1
 model:
   in_channels: 1
   out_channels: 1
@@ -57,26 +62,22 @@ task:
   sample_posterior: true
 loss:
   w_char: 1.0
-  w_ms_ssim: 0.12
-  w_grad: 0.08
+  w_ms_ssim: 0.1
+  w_grad: 0.05
   w_flux: 0.01
-  w_hf: 0.02
-  w_dark_fp: 0.15
-  dark_fp_quantile: 0.20
+  w_hf: 0.0
+  w_dark_fp: 0.0
   free_nats: 0.5
   ms_ssim_start_step: 1000
   ms_ssim_ramp_steps: 500
-  amp_norm: true
-  amp_norm_min_scale: 0.20
-  amp_low_structure_range: 0.08
-  amp_low_structure_scale: 1.0
-  edge_weight: 0.75
-  edge_weight_clip: 3.0
-  ssim_range_mode: amp_space
+  amp_norm: false
+  edge_weight: 0.0
+  edge_weight_clip: 0.0
+  ssim_range_mode: fixed
 kl_schedule:
   t0: 2000
-  t1: 25000
-  beta_max: 0.008
+  t1: 20000
+  beta_max: 0.01
 optimizer:
   name: adamw
   lr: 0.00008

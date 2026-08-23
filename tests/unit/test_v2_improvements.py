@@ -113,16 +113,20 @@ def test_amp_scale_is_per_sample():
     assert float(s[1]) > float(s[0])
 
 
-def test_v21_yaml_loads_artifact_guards():
+def test_v21_yaml_uses_v1_loss_family():
     from pathlib import Path
 
     path = Path(__file__).resolve().parents[2] / "configs" / "experiment" / "s1_hq_f4z4_v2_1.yaml"
     cfg = load_config(path)
-    assert cfg.loss.amp_low_structure_range == 0.08
-    assert cfg.loss.amp_norm_min_scale == 0.20
-    assert cfg.loss.edge_weight_clip == 3.0
-    assert cfg.loss.w_dark_fp == 0.15
-    assert cfg.crop.min_robust_range == 0.08
+    assert cfg.loss.amp_norm is False
+    assert cfg.loss.edge_weight == 0.0
+    assert cfg.loss.w_hf == 0.0
+    assert cfg.loss.w_dark_fp == 0.0
+    assert cfg.loss.w_char == 1.0
+    assert cfg.loss.w_ms_ssim == 0.1
+    assert cfg.loss.w_grad == 0.05
+    assert cfg.model.upsample_mode == "bilinear"
+    assert len(cfg.model.encoder_block_out_channels) == 3
     assert cfg.evaluation.allow_test is False
 
 
