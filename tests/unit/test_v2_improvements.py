@@ -113,21 +113,37 @@ def test_amp_scale_is_per_sample():
     assert float(s[1]) > float(s[0])
 
 
-def test_v21_yaml_uses_v1_loss_family():
+def test_v21_yaml_structure_gate_not_dark_loss():
     from pathlib import Path
 
     path = Path(__file__).resolve().parents[2] / "configs" / "experiment" / "s1_hq_f4z4_v2_1.yaml"
     cfg = load_config(path)
-    assert cfg.loss.amp_norm is False
-    assert cfg.loss.edge_weight == 0.0
-    assert cfg.loss.w_hf == 0.0
+    assert cfg.loss.amp_norm is True
+    assert cfg.loss.amp_low_structure_range == 0.08
+    assert cfg.loss.amp_norm_min_scale == 0.20
+    assert cfg.loss.idle_loss_mult == 0.25
+    assert cfg.loss.edge_weight == 0.75
+    assert cfg.loss.edge_weight_clip == 3.0
+    assert cfg.loss.w_hf == 0.05
     assert cfg.loss.w_dark_fp == 0.0
-    assert cfg.loss.w_char == 1.0
-    assert cfg.loss.w_ms_ssim == 0.1
-    assert cfg.loss.w_grad == 0.05
+    assert cfg.loss.structure_support_kernel == 9
+    assert cfg.loss.structure_support_floor == 0.02
+    assert cfg.loss.structure_support_min_density == 0.15
+    assert cfg.loss.structure_min_frac == 0.001
+    assert cfg.crop.min_robust_range == 0.08
     assert cfg.model.upsample_mode == "bilinear"
-    assert len(cfg.model.encoder_block_out_channels) == 3
     assert cfg.evaluation.allow_test is False
+
+
+def test_v1_yaml_does_not_enable_pixel_gate():
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "configs" / "experiment" / "s1_hq_f8z4.yaml"
+    cfg = load_config(path)
+    assert cfg.loss.amp_norm is False
+    assert cfg.loss.structure_support_kernel == 0
+    assert cfg.loss.w_hf == 0.0
+    assert cfg.loss.edge_weight == 0.0
 
 
 def test_amp_norm_does_not_amplify_empty_patch():

@@ -10,10 +10,13 @@ from microscopy_vae.losses.pixel import (
     dark_false_positive_loss,
     flux_loss,
     highpass_residual,
+    masked_spatial_mean,
+    per_sample_robust_range,
     per_sample_robust_scale,
+    structure_support_mask,
     target_grad_weight,
 )
-from microscopy_vae.losses.structure import ms_ssim_loss, scharr_grad_loss
+from microscopy_vae.losses.structure import ms_ssim_loss, scharr_grad_map
 from microscopy_vae.losses.types import LossOutput
 from microscopy_vae.models.posterior import PosteriorStats
 from microscopy_vae.models.vae import VAEOutput
@@ -47,6 +50,12 @@ class HQCodecLossComposer:
         ssim_range_mode: str = "fixed",
         w_dark_fp: float = 0.0,
         dark_fp_quantile: float = 0.20,
+        idle_loss_mult: float = 1.0,
+        structure_support_kernel: int = 0,
+        structure_support_floor: float = 0.02,
+        structure_support_rel: float = 0.25,
+        structure_support_min_density: float = 0.15,
+        structure_min_frac: float = 0.0,
     ) -> None:
         self.w_char = w_char
         self.w_ms_ssim = w_ms_ssim
@@ -70,6 +79,12 @@ class HQCodecLossComposer:
         self.ssim_range_mode = str(ssim_range_mode)
         self.w_dark_fp = float(w_dark_fp)
         self.dark_fp_quantile = float(dark_fp_quantile)
+        self.idle_loss_mult = float(idle_loss_mult)
+        self.structure_support_kernel = int(structure_support_kernel)
+        self.structure_support_floor = float(structure_support_floor)
+        self.structure_support_rel = float(structure_support_rel)
+        self.structure_support_min_density = float(structure_support_min_density)
+        self.structure_min_frac = float(structure_min_frac)
 
     def _ms_weight(self, optimizer_step: int) -> float:
         if optimizer_step < self.ms_ssim_start_step:
@@ -90,8 +105,30 @@ class HQCodecLossComposer:
     ) -> LossOutput:
         pred = output.reconstruction
         posterior: PosteriorStats = output.posterior
+        bsz = int(target.shape[0])
+        dtype = pred.float().dtype
+        rng = per_sample_robust_range(target)
+        support = structure_support_mask(
+            target,
+            kernel=self.structure_support_kernel,
+            floor=self.structure_support_floor,
+            rel=self.structure_support_rel,
+            min_density=self.structure_support_min_density,
+        )
+        if mask is not None:
+            support = support * mask.to(dtype=support.dtype)
+        support_frac = support.mean(dim=(1, 2, 3))
+        idle = torch.zeros(bsz, dtype=torch.bool, device=target.device)
+        if self.amp_low_structure_range > 0:
+            idle = idle | (rng < float(self.amp_low_structure_range))
+        if self.structure_min_frac > 0:
+            idle = idle | (support_frac < float(self.structure_min_frac))
+        active = (~idle).to(dtype=dtype)
+        # Pixel gate is off on idle crops (v1 path: no edge/HF/Scharr boost).
+        support_on = support * active.view(bsz, 1, 1, 1)
 
         pred_s, tgt_s = pred, target
+        scale = pred.new_ones((bsz, 1, 1, 1))
         if self.amp_norm:
             scale = per_sample_robust_scale(
                 target,
@@ -101,27 +138,61 @@ class HQCodecLossComposer:
             )
             pred_s = pred / scale
             tgt_s = target / scale
+
         pix_w = target_grad_weight(
-            tgt_s, edge_weight=self.edge_weight, clip=self.edge_weight_clip
+            tgt_s,
+            edge_weight=self.edge_weight,
+            clip=self.edge_weight_clip,
+            support=support_on if self.structure_support_kernel > 1 else None,
         )
+        if bool(idle.any().item()) and self.edge_weight > 0:
+            pix_w = pix_w.clone()
+            pix_w[idle] = 1.0
+        sample_w = torch.where(
+            idle,
+            pix_w.new_full((bsz,), self.idle_loss_mult),
+            pix_w.new_ones(bsz),
+        ).view(bsz, 1, 1, 1)
         l_char = charbonnier_loss(
-            pred_s, tgt_s, eps=self.charbonnier_eps, mask=mask, pixel_weight=pix_w
+            pred_s,
+            tgt_s,
+            eps=self.charbonnier_eps,
+            mask=mask,
+            pixel_weight=pix_w * sample_w,
         )
         w_ms = self._ms_weight(optimizer_step)
         if w_ms > 0:
             if self.ssim_range_mode == "amp_space":
-                l_ms = ms_ssim_loss(pred_s, tgt_s, data_range=1.0)
+                l_ms_ps = ms_ssim_loss(pred_s, tgt_s, data_range=1.0, reduce=False)
             else:
-                l_ms = ms_ssim_loss(pred, target, data_range=self.ssim_data_range)
+                l_ms_ps = ms_ssim_loss(pred, target, data_range=self.ssim_data_range, reduce=False)
+            if float(active.sum()) > 0:
+                l_ms = (l_ms_ps * active).sum() / active.sum()
+            else:
+                l_ms = pred.new_zeros(())
         else:
             l_ms = pred.new_zeros(())
-        l_grad = scharr_grad_loss(pred_s, tgt_s)
+
+        if self.w_grad > 0:
+            gmap = scharr_grad_map(pred_s, tgt_s)
+            g_ps = masked_spatial_mean(gmap, support_on)
+            if float(active.sum()) > 0:
+                l_grad = (g_ps * active).sum() / active.sum()
+            else:
+                l_grad = pred.new_zeros(())
+        else:
+            l_grad = pred.new_zeros(())
+
         if self.w_hf > 0:
-            l_hf = charbonnier_loss(
-                highpass_residual(pred_s),
-                highpass_residual(tgt_s),
-                eps=self.charbonnier_eps,
+            hp = torch.sqrt(
+                (highpass_residual(pred_s) - highpass_residual(tgt_s)) ** 2
+                + self.charbonnier_eps**2
             )
+            hp_ps = masked_spatial_mean(hp, support_on)
+            if float(active.sum()) > 0:
+                l_hf = (hp_ps * active).sum() / active.sum()
+            else:
+                l_hf = pred.new_zeros(())
         else:
             l_hf = pred.new_zeros(())
         l_flux = flux_loss(pred, target)
@@ -158,6 +229,9 @@ class HQCodecLossComposer:
         diag.update(output.diagnostics)
         diag["beta"] = torch.tensor(beta, device=pred.device)
         diag["w_ms_ssim_effective"] = torch.tensor(w_ms, device=pred.device)
+        diag["idle_frac"] = idle.to(dtype=dtype).mean().detach()
+        diag["support_frac"] = support_frac.mean().detach()
+        diag["amp_scale_mean"] = scale.detach().float().mean()
         return LossOutput(
             total=total,
             unweighted=unweighted,

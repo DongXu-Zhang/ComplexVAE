@@ -150,6 +150,17 @@ class LossConfig(BaseModel):
     # Penalize recon > target on the darkest quantile of each crop (background speckle).
     w_dark_fp: float = 0.0
     dark_fp_quantile: float = 0.20
+    # Idle (unstructured) crops keep Charbonnier/Flux/KL but this multiplier
+    # downweights them in the pixel term. 1.0 = legacy. Not a new loss term.
+    idle_loss_mult: float = 1.0
+    # Pixel-level structure support. 0/1 = off. Isolated spikes (any intensity)
+    # fail the local density test; filaments/puncta pass. Not a color loss.
+    structure_support_kernel: int = 0
+    structure_support_floor: float = 0.02
+    structure_support_rel: float = 0.25
+    structure_support_min_density: float = 0.15
+    # Additional idle if supported pixel fraction is below this. 0 = off.
+    structure_min_frac: float = 0.0
 
 
 class KLScheduleConfig(BaseModel):

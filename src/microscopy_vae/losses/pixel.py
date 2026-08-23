@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from microscopy_vae.losses.structure import scharr_magnitude
+
 
 def per_sample_robust_range(target: torch.Tensor) -> torch.Tensor:
     """Per-sample p99.5-p0.5, shape [B]."""
@@ -33,23 +35,71 @@ def per_sample_robust_scale(
     return s.view(-1, 1, 1, 1)
 
 
+def structure_support_mask(
+    target: torch.Tensor,
+    *,
+    kernel: int = 9,
+    floor: float = 0.02,
+    rel: float = 0.25,
+    min_density: float = 0.15,
+) -> torch.Tensor:
+    """Spatially supported structure, not intensity/color.
+
+    A pixel counts only if its Scharr magnitude is above tau *and* the local
+    density of such pixels in a k×k window is high enough. Isolated spikes
+    (black or grey) make a small gradient ring and fail the density test;
+    filaments and puncta pass. Mask is detached. kernel<=1 disables (all-ones).
+    """
+    if int(kernel) <= 1:
+        return torch.ones_like(target)
+    k = int(kernel)
+    if k % 2 == 0:
+        raise ValueError(f"structure support kernel must be odd, got {k}")
+    mag = scharr_magnitude(target)
+    tau = torch.clamp(
+        mag.mean(dim=(1, 2, 3), keepdim=True) * float(rel),
+        min=float(floor),
+    )
+    high = (mag > tau).to(dtype=target.dtype)
+    pad = k // 2
+    density = F.avg_pool2d(
+        F.pad(high, (pad, pad, pad, pad), mode="reflect"),
+        kernel_size=k,
+        stride=1,
+    )
+    dense_enough = (density >= float(min_density)).to(dtype=target.dtype)
+    return (high * dense_enough).detach()
+
+
+def masked_spatial_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Per-sample mean of x where mask>0. Shape [B]; 0 if a sample has no mass."""
+    m = mask.to(dtype=x.dtype)
+    mass = m.flatten(1).sum(dim=1)
+    num = (x * m).flatten(1).sum(dim=1)
+    out = num / mass.clamp_min(1.0)
+    return torch.where(mass > 0, out, torch.zeros_like(out))
+
+
 def target_grad_weight(
     target: torch.Tensor,
     *,
     edge_weight: float,
     clip: float = 0.0,
+    support: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """1 + edge_weight * (|∇t| / mean|∇t|). Same Scharr orientation as the grad loss."""
+    """1 + edge_weight * (|∇t| / mean|∇t|). Extra weight only on `support` if given."""
     if edge_weight <= 0:
         return torch.ones_like(target)
-    kx = target.new_tensor([[-3.0, 0.0, 3.0], [-10.0, 0.0, 10.0], [-3.0, 0.0, 3.0]])
-    ky = target.new_tensor([[-3.0, -10.0, -3.0], [0.0, 0.0, 0.0], [3.0, 10.0, 3.0]])
-    kx = (kx / kx.abs().sum()).view(1, 1, 3, 3)
-    ky = (ky / ky.abs().sum()).view(1, 1, 3, 3)
-    t = F.pad(target.float(), (1, 1, 1, 1), mode="reflect")
-    mag = (F.conv2d(t, kx).abs() + F.conv2d(t, ky).abs()).clamp_min(0.0)
-    denom = mag.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
-    w = 1.0 + float(edge_weight) * (mag / denom)
+    mag = scharr_magnitude(target).clamp_min(0.0)
+    if support is not None:
+        mass = support.sum(dim=(1, 2, 3), keepdim=True).clamp_min(1.0)
+        denom = (mag * support).sum(dim=(1, 2, 3), keepdim=True) / mass
+        denom = denom.clamp_min(1e-6)
+        extra = float(edge_weight) * (mag / denom) * support
+    else:
+        denom = mag.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+        extra = float(edge_weight) * (mag / denom)
+    w = 1.0 + extra
     if clip > 1.0:
         w = w.clamp(max=float(clip))
     return w

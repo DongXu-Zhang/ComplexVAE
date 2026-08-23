@@ -19,6 +19,7 @@ def ssim_loss(
     window_size: int = 11,
     data_range: float = 1.0,
     pad_mode: str = "reflect",
+    reduce: bool = True,
 ) -> torch.Tensor:
     """1 - SSIM (single scale), FP32. Default reflect pad (not zero) to avoid crop-edge artifacts."""
     pred_f = pred.float()
@@ -46,7 +47,10 @@ def ssim_loss(
     ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / (
         (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2)
     )
-    return 1.0 - ssim_map.mean()
+    per = 1.0 - ssim_map.mean(dim=(1, 2, 3))
+    if reduce:
+        return per.mean()
+    return per
 
 
 def ms_ssim_loss(
@@ -56,6 +60,7 @@ def ms_ssim_loss(
     levels: int = 4,
     data_range: float = 1.0,
     pad_mode: str = "reflect",
+    reduce: bool = True,
 ) -> torch.Tensor:
     """Simplified multi-scale SSIM: weighted average of (1-SSIM) over pyramid levels.
 
@@ -63,10 +68,12 @@ def ms_ssim_loss(
     """
     weights = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333][:levels]
     weights = [w / sum(weights) for w in weights]
-    total = pred.new_zeros(())
+    total = pred.new_zeros(pred.shape[0]) if not reduce else pred.new_zeros(())
     x, y = pred, target
     for i, w in enumerate(weights):
-        total = total + w * ssim_loss(x, y, data_range=data_range, pad_mode=pad_mode)
+        total = total + w * ssim_loss(
+            x, y, data_range=data_range, pad_mode=pad_mode, reduce=reduce
+        )
         if i < levels - 1:
             x = F.avg_pool2d(x, kernel_size=2, stride=2, ceil_mode=True)
             y = F.avg_pool2d(y, kernel_size=2, stride=2, ceil_mode=True)
@@ -84,17 +91,44 @@ _SCHARR_X = _SCHARR_X / _SCHARR_X.abs().sum()
 _SCHARR_Y = _SCHARR_Y / _SCHARR_Y.abs().sum()
 
 
-def scharr_grad_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _scharr_kernels(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    c = x.shape[1]
+    kx = _SCHARR_X.to(device=x.device, dtype=x.dtype).view(1, 1, 3, 3).expand(c, 1, 3, 3)
+    ky = _SCHARR_Y.to(device=x.device, dtype=x.dtype).view(1, 1, 3, 3).expand(c, 1, 3, 3)
+    return kx, ky
+
+
+def scharr_components(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reflect-padded Scharr gx, gy, same shape as x."""
+    x_f = F.pad(x.float(), (1, 1, 1, 1), mode="reflect")
+    kx, ky = _scharr_kernels(x)
+    return F.conv2d(x_f, kx, padding=0, groups=x.shape[1]), F.conv2d(
+        x_f, ky, padding=0, groups=x.shape[1]
+    )
+
+
+def scharr_magnitude(x: torch.Tensor) -> torch.Tensor:
+    """|gx| + |gy|, shape [B,C,H,W]."""
+    gx, gy = scharr_components(x)
+    return gx.abs() + gy.abs()
+
+
+def scharr_grad_map(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Per-pixel |Δgx| + |Δgy|, shape [B,C,H,W]."""
+    gx_p, gy_p = scharr_components(pred)
+    gx_t, gy_t = scharr_components(target)
+    return (gx_p - gx_t).abs() + (gy_p - gy_t).abs()
+
+
+def scharr_grad_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    reduce: bool = True,
+) -> torch.Tensor:
     """Mean absolute Scharr gradient error; reflect pad + L1-normalized kernels."""
-    pred_f = pred.float()
-    target_f = target.float()
-    c = pred_f.shape[1]
-    pred_f = F.pad(pred_f, (1, 1, 1, 1), mode="reflect")
-    target_f = F.pad(target_f, (1, 1, 1, 1), mode="reflect")
-    kx = _SCHARR_X.to(device=pred_f.device, dtype=pred_f.dtype).view(1, 1, 3, 3).expand(c, 1, 3, 3)
-    ky = _SCHARR_Y.to(device=pred_f.device, dtype=pred_f.dtype).view(1, 1, 3, 3).expand(c, 1, 3, 3)
-    gx_p = F.conv2d(pred_f, kx, padding=0, groups=c)
-    gy_p = F.conv2d(pred_f, ky, padding=0, groups=c)
-    gx_t = F.conv2d(target_f, kx, padding=0, groups=c)
-    gy_t = F.conv2d(target_f, ky, padding=0, groups=c)
-    return (gx_p - gx_t).abs().mean() + (gy_p - gy_t).abs().mean()
+    per_map = scharr_grad_map(pred, target)
+    per = per_map.mean(dim=(1, 2, 3))
+    if reduce:
+        return per.mean()
+    return per

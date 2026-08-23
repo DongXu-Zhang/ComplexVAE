@@ -46,6 +46,12 @@ def build_hq_codec_system(cfg: RootConfig) -> HQCodecSystem:
         ssim_range_mode=str(getattr(cfg.loss, "ssim_range_mode", "fixed")),
         w_dark_fp=float(getattr(cfg.loss, "w_dark_fp", 0.0)),
         dark_fp_quantile=float(getattr(cfg.loss, "dark_fp_quantile", 0.20)),
+        idle_loss_mult=float(getattr(cfg.loss, "idle_loss_mult", 1.0)),
+        structure_support_kernel=int(getattr(cfg.loss, "structure_support_kernel", 0)),
+        structure_support_floor=float(getattr(cfg.loss, "structure_support_floor", 0.02)),
+        structure_support_rel=float(getattr(cfg.loss, "structure_support_rel", 0.25)),
+        structure_support_min_density=float(getattr(cfg.loss, "structure_support_min_density", 0.15)),
+        structure_min_frac=float(getattr(cfg.loss, "structure_min_frac", 0.0)),
     )
     task = HQCodecTask(vae, loss, sample_posterior=cfg.task.sample_posterior)
     return HQCodecSystem(vae, task)

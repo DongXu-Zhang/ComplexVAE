@@ -130,6 +130,32 @@ def robust_foreground_mask(
     return {"mask": fg.astype(bool), "mode": mode, "fg_frac": frac, "median": med, "mad": mad}
 
 
+def background_false_positive_stats(
+    pred: np.ndarray,
+    target: np.ndarray,
+    *,
+    dark_quantile: float = 0.20,
+    tau: float = 0.02,
+) -> Dict[str, float]:
+    """Eval-only symptom metric: positive residual on the darkest quantile.
+
+    Not a training loss. Intensity quantile measures the visual complaint
+    (white-on-dark); training uses structure support, not this mask.
+    """
+    t = target.astype(np.float64)
+    p = pred.astype(np.float64)
+    q = min(max(float(dark_quantile), 0.01), 0.49)
+    dark = t <= float(np.quantile(t, q))
+    if not np.any(dark):
+        return {"bg_fp_rate": float("nan"), "bg_bias": float("nan"), "bg_mae": float("nan")}
+    d = p[dark] - t[dark]
+    return {
+        "bg_fp_rate": float(np.mean(d > float(tau))),
+        "bg_bias": float(np.mean(d)),
+        "bg_mae": float(np.mean(np.abs(d))),
+    }
+
+
 def fg_bg_error_stats(pred: np.ndarray, target: np.ndarray, mask: np.ndarray) -> Dict[str, float]:
     pred = pred.astype(np.float64)
     target = target.astype(np.float64)

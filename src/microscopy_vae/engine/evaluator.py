@@ -15,7 +15,7 @@ from microscopy_vae.metrics.aggregation import (
     page_to_group_macro,
     volume_mse_pooled_psnr,
 )
-from microscopy_vae.metrics.extended import nmse, ssim_mean
+from microscopy_vae.metrics.extended import background_false_positive_stats, nmse, ssim_mean
 from microscopy_vae.metrics.fidelity import mae, mse, psnr, signed_mean_bias
 from microscopy_vae.systems.hq_codec import HQCodecSystem
 
@@ -73,6 +73,8 @@ def evaluate_hq_loader(
                 m["snr_db"] = float(snr)
                 m["ssim_range1"] = float(ssim_mean(ri_np, xi_np, data_range=1.0))
                 m["target_std"] = float(xi_np.std())
+                bg = background_false_positive_stats(ri_np, xi_np)
+                m.update(bg)
             page_metrics.append(m)
             group_ids.append(batch.group_ids[i])
             sources.append(batch.sources[i])
@@ -91,7 +93,7 @@ def evaluate_hq_loader(
 
     keys = ["mae", "mse", "psnr", "signed_bias", "abs_bias", "kl_mean"]
     if extended_metrics:
-        keys.extend(["nmse", "snr_db", "ssim_range1", "target_std"])
+        keys.extend(["nmse", "snr_db", "ssim_range1", "target_std", "bg_fp_rate", "bg_bias", "bg_mae"])
     macro = page_to_group_macro(page_metrics, group_ids, keys)
     macro["psnr_mse_pooled"] = volume_mse_pooled_psnr(
         [m["mse"] for m in page_metrics], group_ids, data_range=1.0
