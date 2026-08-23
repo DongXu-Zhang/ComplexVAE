@@ -37,9 +37,15 @@ def build_hq_codec_system(cfg: RootConfig) -> HQCodecSystem:
         charbonnier_eps=cfg.loss.charbonnier_eps,
         ssim_data_range=cfg.normalization.ssim_data_range,
         amp_norm=bool(getattr(cfg.loss, "amp_norm", False)),
+        amp_norm_min_scale=float(getattr(cfg.loss, "amp_norm_min_scale", 0.05)),
+        amp_low_structure_range=float(getattr(cfg.loss, "amp_low_structure_range", 0.0)),
+        amp_low_structure_scale=float(getattr(cfg.loss, "amp_low_structure_scale", 1.0)),
         edge_weight=float(getattr(cfg.loss, "edge_weight", 0.0)),
+        edge_weight_clip=float(getattr(cfg.loss, "edge_weight_clip", 0.0)),
         w_hf=float(getattr(cfg.loss, "w_hf", 0.0)),
         ssim_range_mode=str(getattr(cfg.loss, "ssim_range_mode", "fixed")),
+        w_dark_fp=float(getattr(cfg.loss, "w_dark_fp", 0.0)),
+        dark_fp_quantile=float(getattr(cfg.loss, "dark_fp_quantile", 0.20)),
     )
     task = HQCodecTask(vae, loss, sample_posterior=cfg.task.sample_posterior)
     return HQCodecSystem(vae, task)

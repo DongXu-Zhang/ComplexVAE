@@ -63,6 +63,34 @@ def take_crop(
     return img[y0 : y0 + cs, x0 : x0 + cs]
 
 
+def _normalized_robust_range(norm: np.ndarray) -> float:
+    lo, hi = np.quantile(norm.astype(np.float64), [0.005, 0.995])
+    return float(hi - lo)
+
+
+def _select_crop(
+    image: np.ndarray,
+    idx: int,
+    *,
+    crop_fn: Callable[[np.ndarray, int], np.ndarray],
+    normalizer: Normalizer,
+    min_robust_range: float,
+    max_retries: int,
+    allow_retry: bool,
+) -> tuple:
+    crop = crop_fn(image, idx)
+    norm = normalizer.transform(crop)
+    if (not allow_retry) or min_robust_range <= 0:
+        return crop, norm
+    tries = max(int(max_retries), 1)
+    for _ in range(tries - 1):
+        if _normalized_robust_range(norm) >= min_robust_range:
+            return crop, norm
+        crop = crop_fn(image, idx)
+        norm = normalizer.transform(crop)
+    return crop, norm
+
+
 class SyntheticHQDataset(Dataset):
     """In-memory synthetic HQ pages with random or fixed crops."""
 
@@ -77,6 +105,8 @@ class SyntheticHQDataset(Dataset):
         seed: int = 0,
         crop_mode: str = "random",
         coverage_jitter_frac: float = 0.25,
+        min_robust_range: float = 0.0,
+        max_range_retries: int = 8,
     ) -> None:
         if split == "test":
             raise RuntimeError("Refuse to construct test dataset without freeze credentials")
@@ -89,6 +119,8 @@ class SyntheticHQDataset(Dataset):
         self.seed = seed
         self.crop_mode = crop_mode
         self.coverage_jitter_frac = float(coverage_jitter_frac)
+        self.min_robust_range = float(min_robust_range)
+        self.max_range_retries = int(max_range_retries)
         self._cell_hits: Dict[int, np.ndarray] = {}
         self._coverage_draws = 0
         # public metadata for hierarchical sampler
@@ -124,8 +156,15 @@ class SyntheticHQDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         p = self.pages[idx]
-        crop = self._crop(p.image, idx)
-        norm = self.normalizer.transform(crop)
+        crop, norm = _select_crop(
+            p.image,
+            idx,
+            crop_fn=self._crop,
+            normalizer=self.normalizer,
+            min_robust_range=self.min_robust_range,
+            max_retries=self.max_range_retries,
+            allow_retry=(not self.fixed_crops),
+        )
         tensor = torch.from_numpy(np.ascontiguousarray(norm)).unsqueeze(0)
         return {
             "hq": tensor,
@@ -156,6 +195,8 @@ class ManifestHQDataset(Dataset):
         seed: int = 0,
         crop_mode: str = "random",
         coverage_jitter_frac: float = 0.25,
+        min_robust_range: float = 0.0,
+        max_range_retries: int = 8,
     ) -> None:
         if split == "test":
             raise RuntimeError("Refuse to construct test dataset without freeze credentials")
@@ -171,6 +212,8 @@ class ManifestHQDataset(Dataset):
         self.seed = seed
         self.crop_mode = crop_mode
         self.coverage_jitter_frac = float(coverage_jitter_frac)
+        self.min_robust_range = float(min_robust_range)
+        self.max_range_retries = int(max_range_retries)
         self._cell_hits: Dict[int, np.ndarray] = {}
         self._coverage_draws = 0
         self.meta = [
@@ -213,8 +256,15 @@ class ManifestHQDataset(Dataset):
                     f"page shape mismatch for {r.sample_id}: got {page.shape}, "
                     f"manifest {r.hq_page_shape}"
                 )
-        crop = self._crop(page, idx)
-        norm = self.normalizer.transform(crop)
+        crop, norm = _select_crop(
+            page,
+            idx,
+            crop_fn=self._crop,
+            normalizer=self.normalizer,
+            min_robust_range=self.min_robust_range,
+            max_retries=self.max_range_retries,
+            allow_retry=(not self.fixed_crops),
+        )
         tensor = torch.from_numpy(np.ascontiguousarray(norm)).unsqueeze(0)
         return {
             "hq": tensor,

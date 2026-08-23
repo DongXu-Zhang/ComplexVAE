@@ -4,7 +4,9 @@ import torch
 from microscopy_vae.config.loader import load_config
 from microscopy_vae.data.hq_dataset import take_crop
 from microscopy_vae.data.samplers import HierarchicalIndexSampler
-from microscopy_vae.losses.pixel import charbonnier_loss, per_sample_robust_scale
+import pytest
+
+from microscopy_vae.losses.pixel import charbonnier_loss, per_sample_robust_scale, target_grad_weight
 from microscopy_vae.models.factory import ModelFactory
 from microscopy_vae.models.blocks import Downsample2D, Upsample2D
 
@@ -109,6 +111,50 @@ def test_amp_scale_is_per_sample():
     s = per_sample_robust_scale(a, min_scale=0.01)
     assert s.shape == (2, 1, 1, 1)
     assert float(s[1]) > float(s[0])
+
+
+def test_v21_yaml_loads_artifact_guards():
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "configs" / "experiment" / "s1_hq_f4z4_v2_1.yaml"
+    cfg = load_config(path)
+    assert cfg.loss.amp_low_structure_range == 0.08
+    assert cfg.loss.amp_norm_min_scale == 0.20
+    assert cfg.loss.edge_weight_clip == 3.0
+    assert cfg.loss.w_dark_fp == 0.15
+    assert cfg.crop.min_robust_range == 0.08
+    assert cfg.evaluation.allow_test is False
+
+
+def test_amp_norm_does_not_amplify_empty_patch():
+    empty = torch.full((1, 1, 32, 32), 0.06)
+    empty[0, 0, 0, 0] = 0.065  # tiny range << 0.08
+    s_legacy = per_sample_robust_scale(empty, min_scale=0.05)
+    s_guard = per_sample_robust_scale(
+        empty, min_scale=0.20, low_structure_range=0.08, low_structure_scale=1.0
+    )
+    assert float(s_legacy) == pytest.approx(0.05)
+    assert float(s_guard) == pytest.approx(1.0)
+
+
+def test_edge_weight_clip():
+    t = torch.zeros(1, 1, 16, 16)
+    t[0, 0, 8, 8] = 5.0
+    w = target_grad_weight(t, edge_weight=0.75, clip=3.0)
+    assert float(w.max()) <= 3.0 + 1e-5
+
+
+def test_dark_false_positive_penalizes_bg_bright():
+    target = torch.zeros(1, 1, 16, 16)
+    target[0, 0, 8:12, 8:12] = 1.0
+    pred_ok = target.clone()
+    pred_spots = target.clone()
+    pred_spots[0, 0, 0:3, 0:3] = 0.4  # white speckle on dark bg
+    from microscopy_vae.losses.pixel import dark_false_positive_loss
+
+    l_ok = float(dark_false_positive_loss(pred_ok, target))
+    l_bad = float(dark_false_positive_loss(pred_spots, target))
+    assert l_bad > l_ok
 
 
 def test_charbonnier_pixel_weight_changes_value():

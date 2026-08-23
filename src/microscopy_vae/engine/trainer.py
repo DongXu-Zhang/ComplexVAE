@@ -233,6 +233,8 @@ class Trainer:
 
         crop_mode = str(getattr(cfg.crop, "mode", "random"))
         jitter = float(getattr(cfg.crop, "coverage_jitter_frac", 0.25))
+        min_rr = float(getattr(cfg.crop, "min_robust_range", 0.0))
+        max_rr = int(getattr(cfg.crop, "max_range_retries", 8))
         self.train_set = train_cls(
             train_arg,
             split="train",
@@ -242,6 +244,8 @@ class Trainer:
             seed=cfg.experiment.seed,
             crop_mode=crop_mode,
             coverage_jitter_frac=jitter,
+            min_robust_range=min_rr,
+            max_range_retries=max_rr,
         )
         self.val_set = val_cls(
             val_arg,
@@ -252,6 +256,8 @@ class Trainer:
             seed=cfg.experiment.seed + 1,
             crop_mode="random",
             coverage_jitter_frac=jitter,
+            min_robust_range=0.0,
+            max_range_retries=1,
         )
 
         slice_scores: Dict[int, float] = {}

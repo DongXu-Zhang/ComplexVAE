@@ -4,15 +4,41 @@ import torch
 import torch.nn.functional as F
 
 
-def per_sample_robust_scale(target: torch.Tensor, *, min_scale: float = 0.05) -> torch.Tensor:
-    """Per-sample p99.5-p0.5 range, shape [B,1,1,1]."""
+def per_sample_robust_range(target: torch.Tensor) -> torch.Tensor:
+    """Per-sample p99.5-p0.5, shape [B]."""
     flat = target.reshape(target.shape[0], -1)
     hi = torch.quantile(flat, 0.995, dim=1)
     lo = torch.quantile(flat, 0.005, dim=1)
-    return (hi - lo).clamp_min(min_scale).view(-1, 1, 1, 1)
+    return (hi - lo).clamp_min(0.0)
 
 
-def target_grad_weight(target: torch.Tensor, *, edge_weight: float) -> torch.Tensor:
+def per_sample_robust_scale(
+    target: torch.Tensor,
+    *,
+    min_scale: float = 0.05,
+    low_structure_range: float = 0.0,
+    low_structure_scale: float = 1.0,
+) -> torch.Tensor:
+    """Per-sample divisor for amp_norm, shape [B,1,1,1].
+
+    Default (low_structure_range=0) matches v2: s = max(range, min_scale).
+    If range < low_structure_range, use low_structure_scale instead of amplifying
+    empty / near-black patches (that was producing white speckle on dark bg).
+    """
+    rng = per_sample_robust_range(target)
+    s = rng.clamp_min(min_scale)
+    if low_structure_range > 0:
+        idle = rng < float(low_structure_range)
+        s = torch.where(idle, s.new_full(s.shape, float(low_structure_scale)), s)
+    return s.view(-1, 1, 1, 1)
+
+
+def target_grad_weight(
+    target: torch.Tensor,
+    *,
+    edge_weight: float,
+    clip: float = 0.0,
+) -> torch.Tensor:
     """1 + edge_weight * (|∇t| / mean|∇t|). Same Scharr orientation as the grad loss."""
     if edge_weight <= 0:
         return torch.ones_like(target)
@@ -23,7 +49,34 @@ def target_grad_weight(target: torch.Tensor, *, edge_weight: float) -> torch.Ten
     t = F.pad(target.float(), (1, 1, 1, 1), mode="reflect")
     mag = (F.conv2d(t, kx).abs() + F.conv2d(t, ky).abs()).clamp_min(0.0)
     denom = mag.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
-    return 1.0 + float(edge_weight) * (mag / denom)
+    w = 1.0 + float(edge_weight) * (mag / denom)
+    if clip > 1.0:
+        w = w.clamp(max=float(clip))
+    return w
+
+
+def dark_false_positive_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    dark_quantile: float = 0.20,
+) -> torch.Tensor:
+    """Mean ReLU(pred-target) on the darkest quantile of each target crop.
+
+    Penalizes white speckle / positive bias in black background without
+    requiring a signed global mean (Flux can cancel fg-dark vs bg-bright).
+    """
+    pred_f = pred.float()
+    target_f = target.float()
+    b = target_f.shape[0]
+    flat = target_f.reshape(b, -1)
+    q = min(max(float(dark_quantile), 0.01), 0.49)
+    thr = torch.quantile(flat, q, dim=1).view(b, 1, 1, 1)
+    dark = (target_f <= thr).to(dtype=pred_f.dtype)
+    pos = torch.relu(pred_f - target_f)
+    denom = dark.flatten(1).sum(dim=1).clamp_min(1.0)
+    per = (pos * dark).flatten(1).sum(dim=1) / denom
+    return per.mean()
 
 
 def charbonnier_loss(

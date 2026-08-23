@@ -70,6 +70,9 @@ class CropConfig(BaseModel):
     # random: original. coverage_jitter: prefer unseen coarse cells, then jitter.
     mode: Literal["random", "coverage_jitter"] = "random"
     coverage_jitter_frac: float = 0.25
+    # Train-only: retry a crop if normalized robust range is below this. 0 disables.
+    min_robust_range: float = 0.0
+    max_range_retries: int = 8
 
 
 class ModelConfig(BaseModel):
@@ -132,11 +135,21 @@ class LossConfig(BaseModel):
     ms_ssim_ramp_steps: int = 500
     # v2: per-sample amplitude normalization of pixel/structure terms (not flux/KL).
     amp_norm: bool = False
+    amp_norm_min_scale: float = 0.05
+    # If per-crop robust range is below this, do NOT amplify (use amp_low_structure_scale).
+    # 0 disables the guard (legacy v2 behaviour that over-weighted empty patches).
+    amp_low_structure_range: float = 0.0
+    amp_low_structure_scale: float = 1.0
     # extra weight on |∇target|-weighted Charbonnier; 0 keeps v1 behaviour.
     edge_weight: float = 0.0
+    # 0 = no clip (legacy). v2.1 uses 3.0 so isolated noise cannot get huge weights.
+    edge_weight_clip: float = 0.0
     # high-pass residual Charbonnier; 0 keeps v1.
     w_hf: float = 0.0
     ssim_range_mode: Literal["fixed", "amp_space"] = "fixed"
+    # Penalize recon > target on the darkest quantile of each crop (background speckle).
+    w_dark_fp: float = 0.0
+    dark_fp_quantile: float = 0.20
 
 
 class KLScheduleConfig(BaseModel):
