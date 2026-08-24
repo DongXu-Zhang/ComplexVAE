@@ -23,6 +23,30 @@ def build_hq_codec_system(cfg: RootConfig) -> HQCodecSystem:
     if cfg.memory.gradient_checkpointing:
         vae.encoder.gradient_checkpointing = True
         vae.decoder.gradient_checkpointing = True
+    perc_mod = None
+    perc_vgg_kwargs = None
+    pcfg = cfg.loss.perceptual
+    if pcfg.enabled:
+        from microscopy_vae.losses.perceptual import build_perceptual_extractor
+
+        perc_mod = build_perceptual_extractor(
+            backbone=pcfg.backbone,
+            freeze=pcfg.freeze,
+            channels=pcfg.channels,
+            kernel_size=pcfg.kernel_size,
+            init_seed=pcfg.init_seed,
+            selected_layers=pcfg.selected_layers,
+            vgg_pretrained=pcfg.vgg_pretrained,
+        )
+        if pcfg.backbone == "vgg16":
+            perc_vgg_kwargs = {
+                "repeat_channels": bool(pcfg.vgg_repeat_channels),
+                "clamp_to_unit": bool(pcfg.vgg_clamp_to_unit),
+                "data_mean": float(pcfg.vgg_data_mean),
+                "data_std": float(pcfg.vgg_data_std),
+                "imagenet_mean": tuple(pcfg.vgg_imagenet_mean),
+                "imagenet_std": tuple(pcfg.vgg_imagenet_std),
+            }
     loss = HQCodecLossComposer(
         w_char=cfg.loss.w_char,
         w_ms_ssim=cfg.loss.w_ms_ssim,
@@ -52,6 +76,18 @@ def build_hq_codec_system(cfg: RootConfig) -> HQCodecSystem:
         structure_support_rel=float(getattr(cfg.loss, "structure_support_rel", 0.25)),
         structure_support_min_density=float(getattr(cfg.loss, "structure_support_min_density", 0.15)),
         structure_min_frac=float(getattr(cfg.loss, "structure_min_frac", 0.0)),
+        perceptual=perc_mod,
+        perc_weight=float(pcfg.weight) if pcfg.enabled else 0.0,
+        perc_start_step=int(pcfg.start_step),
+        perc_ramp_steps=int(pcfg.ramp_steps),
+        perc_layers=list(pcfg.selected_layers),
+        perc_layer_weights=pcfg.layer_weights,
+        perc_distance=str(pcfg.distance),
+        perc_apply_amp_norm=bool(pcfg.apply_amp_norm),
+        perc_unstructured_policy=str(pcfg.unstructured_policy),
+        perc_normalize_features=bool(pcfg.normalize_features),
+        perc_backbone=str(pcfg.backbone),
+        perc_vgg_kwargs=perc_vgg_kwargs,
     )
     task = HQCodecTask(vae, loss, sample_posterior=cfg.task.sample_posterior)
-    return HQCodecSystem(vae, task)
+    return HQCodecSystem(vae, task, perceptual=perc_mod)

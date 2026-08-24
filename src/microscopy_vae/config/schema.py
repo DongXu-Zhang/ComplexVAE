@@ -123,6 +123,73 @@ class TaskConfig(BaseModel):
     sample_posterior: bool = True
 
 
+class PerceptualLossConfig(BaseModel):
+    """Off by default. See losses/perceptual.py for domain-mismatch notes."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    weight: float = 0.05
+    start_step: int = 0
+    ramp_steps: int = 1000
+    backbone: Literal["internal_conv", "vgg16"] = "internal_conv"
+    selected_layers: List[str] = Field(default_factory=lambda: ["block1", "block2", "block3"])
+    layer_weights: Optional[Dict[str, float]] = None
+    distance: Literal["l1", "l2"] = "l1"
+    # Default: global normalized domain, NOT amp-scaled (intensity errors stay visible).
+    apply_amp_norm: bool = False
+    freeze: bool = True
+    channels: List[int] = Field(default_factory=lambda: [16, 32, 64])
+    kernel_size: int = 3
+    init_seed: int = 0
+    normalize_features: bool = False
+    unstructured_policy: Literal["keep", "match_target"] = "match_target"
+    # vgg16 only — all explicit; defaults do not silent-clamp.
+    vgg_pretrained: bool = True
+    vgg_repeat_channels: bool = True
+    vgg_clamp_to_unit: bool = False
+    vgg_data_mean: float = 0.0
+    vgg_data_std: float = 1.0
+    vgg_imagenet_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
+    vgg_imagenet_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+    fail_if_unavailable: bool = True
+
+
+class AdversarialLossConfig(BaseModel):
+    """Off by default. S1 default conditioning is unconditional (input==target)."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    weight: float = 0.02
+    start_step: int = 5000
+    ramp_steps: int = 2000
+    architecture: Literal["patchgan"] = "patchgan"
+    conditioning: Literal["none", "input"] = "none"
+    gan_loss: Literal["hinge", "lsgan"] = "hinge"
+    spectral_norm: bool = True
+    ndf: int = 32
+    n_layers: int = 3
+    kernel_size: int = 4
+    disc_lr: float = 1e-4
+    disc_betas: Tuple[float, float] = (0.5, 0.9)
+    disc_weight_decay: float = 0.0
+    disc_scheduler: Literal["none", "cosine"] = "none"
+    n_critic: int = 1
+    r1_gamma: float = 0.0
+    unstructured_policy: Literal["keep", "exclude"] = "exclude"
+    grad_clip_norm: float = 1.0
+
+
+class LossInfluenceConfig(BaseModel):
+    """Layer-2 ratios are cheap. Layer-3 autograd.grad is periodic and off by default."""
+
+    model_config = ConfigDict(extra="forbid")
+    log_contrib_ratio: bool = True
+    grad_every_steps: int = 0
+    cosine_every_steps: int = 0
+    param_groups: List[str] = Field(default_factory=lambda: ["full", "encoder", "decoder", "output"])
+    ema_decay: float = 0.99
+
+
 class LossConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     w_char: float = 1.0
@@ -161,6 +228,9 @@ class LossConfig(BaseModel):
     structure_support_min_density: float = 0.15
     # Additional idle if supported pixel fraction is below this. 0 = off.
     structure_min_frac: float = 0.0
+    perceptual: PerceptualLossConfig = Field(default_factory=PerceptualLossConfig)
+    adversarial: AdversarialLossConfig = Field(default_factory=AdversarialLossConfig)
+    influence: LossInfluenceConfig = Field(default_factory=LossInfluenceConfig)
 
 
 class KLScheduleConfig(BaseModel):
@@ -211,6 +281,9 @@ class TrainingConfig(BaseModel):
     overfit_n_patches: int = 16
     # resume uses separate field; never generic checkpoint for init
     resume_exact_path: Optional[str] = None
+    # Load VAE weights only (step/optim reset). For ablation warm-start from our
+    # own S1 checkpoint. Mutually exclusive with resume_exact_path. Not ImageNet.
+    warmstart_vae_path: Optional[str] = None
 
 
 class EvaluationConfig(BaseModel):
@@ -313,6 +386,8 @@ class RootConfig(BaseModel):
             raise ValueError("pretrained / from_pretrained / init_from_weights forbidden")
         if self.initialization.mode != "fresh_init" and not self.training.resume_exact_path:
             raise ValueError("only fresh_init or explicit resume_exact_path allowed")
+        if self.training.resume_exact_path and self.training.warmstart_vae_path:
+            raise ValueError("resume_exact_path and warmstart_vae_path are mutually exclusive")
         if self.evaluation.allow_test:
             raise ValueError("evaluation.allow_test must be false until freeze-candidate credentials")
         if "test" in self.data.allow_splits:

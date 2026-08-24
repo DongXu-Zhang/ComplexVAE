@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from microscopy_vae.config.loader import load_config, resolved_dict
+from microscopy_vae.config.loader import config_semantic_hash, load_config, resolved_dict
 from microscopy_vae.config.validation import validate_for_training
 
 
@@ -199,56 +199,205 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _save_float_image(path: Path, arr) -> None:
+    import io
+
+    import numpy as np
+
+    from microscopy_vae.utils.atomic import atomic_write_bytes
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix.lower() in {".tif", ".tiff"}:
+        import os
+        import tempfile
+
+        import tifffile
+
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_", suffix=path.suffix)
+        os.close(fd)
+        try:
+            tifffile.imwrite(tmp, arr)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    else:
+        buf = io.BytesIO()
+        np.save(buf, arr)
+        atomic_write_bytes(path, buf.getvalue())
+
+
 def cmd_infer(args: argparse.Namespace) -> int:
     cfg = _cfg(args)
     from microscopy_vae.systems.factory import build_hq_codec_system
-    from microscopy_vae.engine.checkpoint import CheckpointManager
-    from microscopy_vae.inference.tiling import reconstruct_full, reconstruct_tiled
+    from microscopy_vae.inference.tiling import (
+        attention_matrix_numel,
+        reconstruct_full,
+    )
+    from microscopy_vae.inference.compare import load_infer_weights, run_full_tiled_compare, save_compare_pack
     from microscopy_vae.data.readers import read_page
     from microscopy_vae.data.normalization import NormalizationState, Normalizer
     import numpy as np
 
     if not args.input or not args.output:
         raise SystemExit("infer requires --input and --output")
+    mode = str(getattr(args, "inference_mode", None) or "full")
+    # --tiled is a backward-compat alias only when mode was left at default full.
+    if bool(getattr(args, "tiled", False)) and mode == "full":
+        mode = "tiled"
+    if mode not in {"full", "tiled", "compare"}:
+        raise SystemExit("inference-mode must be full | tiled | compare")
+
+    from microscopy_vae.inference.devices import describe_devices, parse_devices, primary_device
+    from microscopy_vae.inference.parallel import run_tiled
+    from microscopy_vae.provenance.hashing import sha256_file
+    import time
+
+    spec = str(getattr(args, "devices", None) or "auto")
+    try:
+        devices = parse_devices(spec)
+    except ValueError as exc:
+        raise SystemExit(f"--devices: {exc}") from exc
+    primary = primary_device(devices)
+
     system = build_hq_codec_system(cfg)
+    weights_kind = "uninitialized"
     if args.weights:
-        CheckpointManager.load_exported_weights(Path(args.weights), system.vae)
+        weights_kind = load_infer_weights(
+            Path(args.weights), system.vae, use_ema=not bool(getattr(args, "raw_weights", False))
+        )
     system.eval()
+    if system.perceptual is not None:
+        system.perceptual.eval()
     page, _ = read_page(Path(args.input), int(args.page))
+    norm = None
     if args.normalizer:
         norm = Normalizer(NormalizationState.load(Path(args.normalizer)))
         x_np = norm.transform(page)
     else:
         x_np = page.astype(np.float32)
-    x = torch.from_numpy(x_np).unsqueeze(0).unsqueeze(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    system = system.to(device)
-    x = x.to(device)
+    x = torch.from_numpy(np.ascontiguousarray(x_np)).unsqueeze(0).unsqueeze(0)
+    system = system.to(primary)
+    x = x.to(primary)
+    f = int(system.vae.spatial_compression)
+    pad_mode = str(getattr(args, "padding_mode", None) or "reflect")
+    tile_size = int(args.tile_size)
+    overlap = int(args.overlap)
+    blend = str(getattr(args, "blend_mode", None) or "linear")
+
+    h, w = int(x.shape[-2]), int(x.shape[-1])
+    attn_n = attention_matrix_numel(h if h % f == 0 else h + (f - h % f) % f, w if w % f == 0 else w + (f - w % f) % f, f)
+    info: Dict[str, Any] = {
+        "mode": mode,
+        "devices_requested": spec,
+        "devices_actual": [str(d) for d in devices],
+        "devices_info": describe_devices(devices),
+        "world_size": len(devices),
+        "primary_device": str(primary),
+        "input_hw": [h, w],
+        "spatial_compression": f,
+        "weights": weights_kind,
+        "posterior": "mean",
+        "dtype": str(x.dtype),
+        "normalizer": str(args.normalizer) if args.normalizer else None,
+        "attention_matrix_numel_full_padded": int(attn_n),
+        "config_sha256": config_semantic_hash(cfg),
+    }
+    if args.weights:
+        info["weights_sha256"] = sha256_file(Path(args.weights))
+    if args.normalizer:
+        info["normalizer_sha256"] = sha256_file(Path(args.normalizer))
+    if mode == "full" and len(devices) > 1:
+        info["parallel_note"] = (
+            "full inference is batch=1 with global GroupNorm and dense HW×HW attention; "
+            "extra GPUs are idle. Use --inference-mode tiled for multi-GPU speedup."
+        )
+        print(info["parallel_note"], file=sys.stderr)
+    if mode == "full" and attn_n > (96 * 96) ** 2:
+        info["warning"] = (
+            "full-image bottleneck attention is dense HW×HW; "
+            f"matrix has {attn_n} elements. tiled mode is the training-size path."
+        )
+
+    def _sync() -> None:
+        if primary.type == "cuda":
+            torch.cuda.synchronize(primary)
+
     with torch.no_grad():
-        if args.tiled:
-            y = reconstruct_tiled(
+        if mode == "compare":
+            _sync()
+            pack = run_full_tiled_compare(
                 system.vae,
                 x,
-                tile_size=int(args.tile_size),
-                overlap=int(args.overlap),
-                spatial_compression=system.vae.spatial_compression,
+                spatial_compression=f,
+                tile_size=tile_size,
+                overlap=overlap,
+                padding_mode=pad_mode,
+                blend_mode=blend,
+                devices=list(devices),
+                cfg_dump=resolved_dict(cfg),
             )
+            if norm is not None:
+                for k in ("full", "tiled", "target"):
+                    pack[k] = norm.inverse(pack[k])
+                pack["residual_full"] = pack["full"] - pack["target"]
+                pack["residual_tiled"] = pack["tiled"] - pack["target"]
+                pack["diff_full_tiled"] = pack["full"] - pack["tiled"]
+            out_dir = Path(args.output)
+            save_compare_pack(pack, out_dir)
+            tiled_aux = (pack.get("metrics") or {}).get("tiled_aux") or {}
+            info.update(
+                {
+                    "output_dir": str(out_dir),
+                    "metrics": pack["metrics"],
+                    "parallel": tiled_aux.get("parallel"),
+                }
+            )
+            print(json.dumps(info, indent=2, default=float))
+            return 0
+        if mode == "tiled":
+            _sync()
+            t0 = time.perf_counter()
+            y, aux = run_tiled(
+                system.vae,
+                x,
+                cfg_dump=resolved_dict(cfg),
+                devices=list(devices),
+                tile_size=tile_size,
+                overlap=overlap,
+                spatial_compression=f,
+                padding_mode=pad_mode,
+                blend_mode=blend,
+                return_aux=True,
+            )
+            _sync()
+            info["forward_wall_s"] = float(time.perf_counter() - t0)
+            info["tiled_aux"] = {k: v for k, v in aux.items() if k != "weight"}
+            info["parallel"] = aux.get("parallel")
         else:
-            y = reconstruct_full(
-                system.vae, x, spatial_compression=system.vae.spatial_compression
+            _sync()
+            t0 = time.perf_counter()
+            y, aux = reconstruct_full(
+                system.vae, x, spatial_compression=f, padding_mode=pad_mode, return_aux=True
             )
-    y_np = y.squeeze().cpu().numpy().astype(np.float32)
-    if args.normalizer:
+            _sync()
+            info["forward_wall_s"] = float(time.perf_counter() - t0)
+            info["full_aux"] = aux
+            info["parallel"] = {"mode": "none", "reason": "full image uses one device"}
+    y_np = y.squeeze().detach().cpu().numpy().astype(np.float32)
+    if norm is not None:
         y_np = norm.inverse(y_np)
     out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if out.suffix.lower() in {".tif", ".tiff"}:
-        import tifffile
-
-        tifffile.imwrite(str(out), y_np)
-    else:
-        np.save(str(out), y_np)
-    print(json.dumps({"output": str(out), "shape": list(y_np.shape)}, indent=2))
+    _save_float_image(out, y_np)
+    info["output"] = str(out)
+    info["shape"] = list(y_np.shape)
+    if out.is_file():
+        info["output_sha256"] = sha256_file(out)
+    print(json.dumps(info, indent=2, default=float))
     return 0
 
 
@@ -379,9 +528,29 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--weights", type=str, default=None)
             sp.add_argument("--normalizer", type=str, default=None)
             sp.add_argument("--page", type=int, default=0)
-            sp.add_argument("--tiled", action="store_true")
+            sp.add_argument(
+                "--inference-mode",
+                type=str,
+                default="full",
+                choices=["full", "tiled", "compare"],
+                help="full | tiled | compare (same image, same weights, same normalizer)",
+            )
+            sp.add_argument("--tiled", action="store_true", help="alias for --inference-mode tiled")
             sp.add_argument("--tile-size", type=int, default=256)
             sp.add_argument("--overlap", type=int, default=32)
+            sp.add_argument("--blend-mode", type=str, default="linear", choices=["linear", "hann"])
+            sp.add_argument("--padding-mode", type=str, default="reflect")
+            sp.add_argument(
+                "--raw-weights",
+                action="store_true",
+                help="do not copy EMA even if the checkpoint extra contains it",
+            )
+            sp.add_argument(
+                "--devices",
+                type=str,
+                default="auto",
+                help="auto | cpu | cuda | cuda:0 | cuda:0,cuda:2 (logical ids after CUDA_VISIBLE_DEVICES)",
+            )
         if name == "export-latent-spec":
             sp.add_argument("--weights", type=str, default=None)
             sp.add_argument("--out", type=str, default="latent_spec.json")

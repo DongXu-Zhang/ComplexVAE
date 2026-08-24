@@ -15,10 +15,17 @@ from microscopy_vae.tasks.hq_codec import HQCodecTask
 class HQCodecSystem(nn.Module):
     """Owns VAE parameters for HQ-only training. No LR restore capability."""
 
-    def __init__(self, vae: MicroscopyVAE, task: HQCodecTask) -> None:
+    def __init__(
+        self,
+        vae: MicroscopyVAE,
+        task: HQCodecTask,
+        perceptual: Optional[nn.Module] = None,
+    ) -> None:
         super().__init__()
         self.vae = vae
         self.task = task
+        # Frozen feature extractor (optional). Excluded from parameters() / G optimizer.
+        self.perceptual = perceptual
         self.capabilities = TaskCapabilities(
             hq_reconstruction=True,
             lr_encoding=False,

@@ -99,12 +99,15 @@ def _scharr_kernels(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def scharr_components(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reflect-padded Scharr gx, gy, same shape as x."""
+    """Reflect-padded Scharr gx, gy, same spatial shape as x. Always FP32.
+
+    Kernels must match the padded tensor dtype. Building them from the original
+    x (possibly bf16 under autocast) makes conv2d see float input + bf16 weight.
+    """
     x_f = F.pad(x.float(), (1, 1, 1, 1), mode="reflect")
-    kx, ky = _scharr_kernels(x)
-    return F.conv2d(x_f, kx, padding=0, groups=x.shape[1]), F.conv2d(
-        x_f, ky, padding=0, groups=x.shape[1]
-    )
+    kx, ky = _scharr_kernels(x_f)
+    c = x_f.shape[1]
+    return F.conv2d(x_f, kx, padding=0, groups=c), F.conv2d(x_f, ky, padding=0, groups=c)
 
 
 def scharr_magnitude(x: torch.Tensor) -> torch.Tensor:

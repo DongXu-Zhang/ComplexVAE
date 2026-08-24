@@ -24,6 +24,12 @@ from microscopy_vae.engine.schedulers import build_warmup_cosine_scheduler
 from microscopy_vae.engine.state import TrainerState
 from microscopy_vae.provenance.capture import write_environment
 from microscopy_vae.provenance.source_tree import hash_source_tree
+from microscopy_vae.losses.influence import (
+    diagnose_generator_influence,
+    format_loss_breakdown,
+    quantify_generator_losses,
+)
+from microscopy_vae.losses.schedule import scheduled_weight
 from microscopy_vae.systems.factory import build_hq_codec_system
 from microscopy_vae.utils.logging import append_jsonl, setup_logging
 from microscopy_vae.utils.rng import seed_everything
@@ -85,17 +91,22 @@ class Trainer:
 
         self._build_data_and_normalizer()
         self._build_optim()
+        self._build_disc()
         self.ckpt = CheckpointManager(self.run_dir)
         self._grad_checked = False
+        self._contrib_ema: Dict[str, float] = {}
         self.ema: Optional[EMA] = None
         if cfg.training.ema_decay is not None and cfg.training.ema_decay > 0:
             self.ema = EMA(self.system.vae, decay=float(cfg.training.ema_decay))
         self.best_snr = float("-inf")
         self.best_mae = float("inf")
+        self._enter_train_mode()
 
         # Optional resume_exact after optim built
         if cfg.training.resume_exact_path:
             self._resume_exact(Path(cfg.training.resume_exact_path))
+        elif cfg.training.warmstart_vae_path:
+            self._warmstart_vae(Path(cfg.training.warmstart_vae_path))
 
         # Prove no test loader attribute for training API
         assert not hasattr(self, "test_loader")
@@ -365,6 +376,104 @@ class Trainer:
         self.use_amp = cfg.precision.amp_dtype == "bf16" and self.device.type == "cuda"
         self.scaler = None
 
+    def _build_disc(self) -> None:
+        adv = self.cfg.loss.adversarial
+        self.discriminator = None
+        self.disc_optimizer = None
+        self.disc_scheduler = None
+        if not adv.enabled:
+            return
+        from microscopy_vae.losses.adversarial import PatchDiscriminator
+
+        if adv.architecture != "patchgan":
+            raise ValueError(f"unsupported discriminator {adv.architecture!r}")
+        if adv.conditioning == "input":
+            self.logger.warning(
+                "adversarial.conditioning=input is degenerate for S1 HQ codec "
+                "(input==target: concat(x,x) vs concat(x,recon) is a channel-identity cue). "
+                "Prefer conditioning=none unless this is a paired route."
+            )
+        self.discriminator = PatchDiscriminator(
+            in_channels=1,
+            ndf=adv.ndf,
+            n_layers=adv.n_layers,
+            kernel_size=adv.kernel_size,
+            spectral_norm=adv.spectral_norm,
+            conditioning=adv.conditioning,
+        ).to(self.device)
+        self.disc_optimizer = torch.optim.AdamW(
+            self.discriminator.parameters(),
+            lr=adv.disc_lr,
+            betas=adv.disc_betas,
+            eps=self.cfg.optimizer.eps,
+            weight_decay=adv.disc_weight_decay,
+        )
+        if adv.disc_scheduler == "cosine":
+            self.disc_scheduler = build_warmup_cosine_scheduler(
+                self.disc_optimizer,
+                warmup_steps=self.cfg.scheduler.warmup_steps,
+                max_steps=self.cfg.training.max_steps,
+                min_lr=self.cfg.scheduler.min_lr,
+                base_lr=adv.disc_lr,
+            )
+        self.logger.info(
+            "GAN discriminator: patchgan ndf=%s n_layers=%s sn=%s cond=%s loss=%s",
+            adv.ndf,
+            adv.n_layers,
+            adv.spectral_norm,
+            adv.conditioning,
+            adv.gan_loss,
+        )
+
+    def _enter_train_mode(self) -> None:
+        """VAE train; frozen perceptual must stay eval (no BN, but keep the contract)."""
+        self.system.train()
+        if self.system.perceptual is not None:
+            self.system.perceptual.eval()
+
+    def _adv_weight(self, step: int) -> float:
+        adv = self.cfg.loss.adversarial
+        if not adv.enabled or self.discriminator is None:
+            return 0.0
+        return scheduled_weight(adv.weight, step, adv.start_step, adv.ramp_steps)
+
+    def _disc_mask(self, support_on: torch.Tensor) -> Optional[torch.Tensor]:
+        adv = self.cfg.loss.adversarial
+        if adv.unstructured_policy != "exclude":
+            return None
+        return support_on.detach()
+
+    def _ckpt_extra(self, **more: Any) -> Dict[str, Any]:
+        extra: Dict[str, Any] = {
+            "ema": self.ema.state_dict() if self.ema else None,
+            "source_sha": getattr(self, "source_sha", ""),
+            "gan_enabled": self.discriminator is not None,
+            "perc_enabled": self.system.perceptual is not None,
+        }
+        if self.system.perceptual is not None:
+            extra["perceptual"] = self.system.perceptual.state_dict()
+        if self.discriminator is not None:
+            extra["discriminator"] = self.discriminator.state_dict()
+            extra["disc_optimizer"] = self.disc_optimizer.state_dict() if self.disc_optimizer else None
+            extra["disc_scheduler"] = (
+                self.disc_scheduler.state_dict() if self.disc_scheduler is not None else None
+            )
+        extra.update(more)
+        return extra
+
+    def _warmstart_vae(self, path: Path) -> None:
+        self.logger.info("warmstart VAE weights from %s (optim/step reset, not resume_exact)", path)
+        CheckpointManager.load_exported_weights(path, self.system.vae, map_location=str(self.device))
+        payload = None
+        try:
+            payload = torch.load(path, map_location=str(self.device), weights_only=False)
+        except TypeError:
+            payload = torch.load(path, map_location=str(self.device))
+        extra = payload.get("extra") if isinstance(payload, dict) else None
+        if self.ema is not None and isinstance(extra, dict) and extra.get("ema"):
+            self.ema.load_state_dict(extra["ema"])
+        # Discriminator / perc stay freshly built for this config. Trainer state is step 0.
+
     def _resume_exact(self, path: Path) -> None:
         self.logger.info("resume_exact from %s", path)
         self.state, extra = CheckpointManager.resume_exact(
@@ -378,8 +487,28 @@ class Trainer:
             map_location=str(self.device),
             expected_code_version=None,  # warn-only: set if you need hard pin
         )
+        extra = extra or {}
         if self.ema is not None and isinstance(extra, dict) and extra.get("ema"):
             self.ema.load_state_dict(extra["ema"])
+        if self.system.perceptual is not None:
+            if extra.get("perceptual"):
+                self.system.perceptual.load_state_dict(extra["perceptual"])
+            else:
+                self.logger.warning(
+                    "perceptual enabled but checkpoint extra has no perceptual weights; "
+                    "using freshly initialized frozen extractor (init_seed)"
+                )
+        if self.discriminator is not None:
+            if not extra.get("discriminator"):
+                raise ValueError(
+                    "adversarial.enabled=true but checkpoint has no discriminator state; "
+                    "cannot resume_exact a non-GAN run as a GAN run (use warmstart_vae_path)"
+                )
+            self.discriminator.load_state_dict(extra["discriminator"])
+            if self.disc_optimizer is not None and extra.get("disc_optimizer"):
+                self.disc_optimizer.load_state_dict(extra["disc_optimizer"])
+            if self.disc_scheduler is not None and extra.get("disc_scheduler"):
+                self.disc_scheduler.load_state_dict(extra["disc_scheduler"])
 
     def _assert_finite_grads(self) -> None:
         bad = []
@@ -401,6 +530,135 @@ class Trainer:
                 missing.append(pref)
         if missing:
             raise RuntimeError(f"Missing nonzero grads for: {missing}")
+
+    def _attach_adv_g(self, loss_out, batch) -> Any:
+        """Add generator adversarial term. D params must not receive these grads."""
+        if self.discriminator is None:
+            return loss_out
+        w = self._adv_weight(self.state.optimizer_step)
+        loss_out.diagnostics["w_adv_effective"] = torch.tensor(w, device=batch.hq.device)
+        if w <= 0:
+            zero = loss_out.total.new_zeros(())
+            loss_out.unweighted["adv_g"] = zero
+            loss_out.weights["adv_g"] = 0.0
+            loss_out.weighted["adv_g"] = zero
+            return loss_out
+        from microscopy_vae.losses.adversarial import generator_adv_loss
+
+        recon = loss_out.aux["reconstruction"]
+        cond = batch.hq if self.cfg.loss.adversarial.conditioning == "input" else None
+        mask = self._disc_mask(loss_out.aux["support_on"])
+        self.discriminator.requires_grad_(False)
+        g_adv, fake_score = generator_adv_loss(
+            self.discriminator,
+            recon,
+            cond=cond,
+            mask=mask,
+            gan_loss=self.cfg.loss.adversarial.gan_loss,
+        )
+        loss_out.unweighted["adv_g"] = g_adv
+        loss_out.weights["adv_g"] = w
+        loss_out.weighted["adv_g"] = w * g_adv
+        loss_out.total = loss_out.total + w * g_adv
+        loss_out.diagnostics["d_fake_mean_g"] = fake_score
+        return loss_out
+
+    def _backward_disc(self, loss_out, batch, accum: int) -> Dict[str, float]:
+        """Discriminator update backward (accumulated). recon is detached."""
+        logs: Dict[str, float] = {}
+        if self.discriminator is None or self._adv_weight(self.state.optimizer_step) <= 0:
+            return logs
+        from microscopy_vae.losses.adversarial import discriminator_scores
+
+        adv = self.cfg.loss.adversarial
+        recon = loss_out.aux["reconstruction"].detach()
+        real = loss_out.aux["target"].detach()
+        cond = batch.hq.detach() if adv.conditioning == "input" else None
+        mask = self._disc_mask(loss_out.aux["support_on"])
+        if mask is not None and float(mask.sum()) <= 0:
+            return logs
+        self.discriminator.requires_grad_(True)
+        scores = discriminator_scores(
+            self.discriminator,
+            real=real,
+            fake=recon,
+            cond=cond,
+            mask=mask,
+            gan_loss=adv.gan_loss,
+            r1_gamma=float(adv.r1_gamma),
+        )
+        d_loss = scores["loss_d"] / float(accum)
+        if not torch.isfinite(d_loss.detach()):
+            raise RuntimeError(f"Non-finite discriminator loss at step {self.state.optimizer_step}")
+        d_loss.backward()
+        logs["loss_raw_disc"] = float(scores["loss_d"].detach().cpu())
+        logs["loss_disc_real"] = float(scores["loss_d_real"].detach().cpu())
+        logs["loss_disc_fake"] = float(scores["loss_d_fake"].detach().cpu())
+        logs["d_real_mean"] = float(scores["d_real_mean"].detach().cpu())
+        logs["d_fake_mean"] = float(scores["d_fake_mean"].detach().cpu())
+        return logs
+
+    def _extra_critic_steps(self, loss_out, batch) -> None:
+        n_extra = int(self.cfg.loss.adversarial.n_critic) - 1
+        if n_extra <= 0 or self.discriminator is None or self.disc_optimizer is None:
+            return
+        from microscopy_vae.losses.adversarial import discriminator_scores
+
+        adv = self.cfg.loss.adversarial
+        recon = loss_out.aux["reconstruction"].detach()
+        real = loss_out.aux["target"].detach()
+        cond = batch.hq.detach() if adv.conditioning == "input" else None
+        mask = self._disc_mask(loss_out.aux["support_on"])
+        for _ in range(n_extra):
+            self.disc_optimizer.zero_grad(set_to_none=True)
+            self.discriminator.requires_grad_(True)
+            scores = discriminator_scores(
+                self.discriminator,
+                real=real,
+                fake=recon,
+                cond=cond,
+                mask=mask,
+                gan_loss=adv.gan_loss,
+                r1_gamma=float(adv.r1_gamma),
+            )
+            scores["loss_d"].backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.discriminator.parameters(),
+                adv.grad_clip_norm if adv.grad_clip_norm > 0 else 1e9,
+            )
+            self.disc_optimizer.step()
+
+    def _maybe_influence(self, loss_out, last_micro: bool) -> Dict[str, float]:
+        infl_cfg = self.cfg.loss.influence
+        logs: Dict[str, float] = {}
+        if infl_cfg.log_contrib_ratio and last_micro:
+            # Shares come from quantify_generator_losses (full 9-term table).
+            # Here only keep a running EMA of |C_i|.
+            decay = float(infl_cfg.ema_decay)
+            for k, t in loss_out.weighted.items():
+                c = abs(float(t.detach().cpu()))
+                prev = self._contrib_ema.get(k)
+                ema = c if prev is None else decay * prev + (1.0 - decay) * c
+                self._contrib_ema[k] = ema
+                logs[f"contrib_ema_{k}"] = ema
+        every = int(infl_cfg.grad_every_steps)
+        logged_step = self.state.optimizer_step + 1
+        want_grad = last_micro and every > 0 and logged_step % every == 0
+        want_cos = (
+            last_micro
+            and int(infl_cfg.cosine_every_steps) > 0
+            and logged_step % int(infl_cfg.cosine_every_steps) == 0
+        )
+        if want_grad or want_cos:
+            logs.update(
+                diagnose_generator_influence(
+                    loss_out.weighted,
+                    self.system.vae,
+                    param_group_names=tuple(infl_cfg.param_groups),
+                    compute_cosine=want_cos,
+                )
+            )
+        return logs
 
     def _maybe_validate(self) -> Optional[Dict[str, Any]]:
         use_ema = bool(getattr(self.cfg.evaluation, "use_ema_for_val", True)) and self.ema is not None
@@ -462,7 +720,7 @@ class Trainer:
                 config_sha256=self.config_sha,
                 normalizer_sha256=self.normalizer_sha,
                 code_version=__version__,
-                extra={"candidate": True, "val": rec, "ema": self.ema.state_dict() if self.ema else None},
+                extra=self._ckpt_extra(candidate=True, val=rec),
             )
             self.state.candidate_hits[self.state.optimizer_step] = str(path)
         return rec
@@ -474,7 +732,6 @@ class Trainer:
         if snr_v is None or not np.isfinite(snr_v):
             # fall back to range-1 PSNR if extended metrics off
             snr_v = gm.get("psnr")
-        ema_sd = self.ema.state_dict() if self.ema else None
         if (
             getattr(self.cfg.checkpoint, "keep_best_snr", True)
             and snr_v is not None
@@ -492,7 +749,7 @@ class Trainer:
                 config_sha256=self.config_sha,
                 normalizer_sha256=self.normalizer_sha,
                 code_version=__version__,
-                extra={"kind": "best_snr", "val": rec, "ema": ema_sd, "source_sha": getattr(self, "source_sha", "")},
+                extra=self._ckpt_extra(kind="best_snr", val=rec),
             )
             self.logger.info("new best SNR/PSNR-proxy=%.4f at step %s", self.best_snr, self.state.optimizer_step)
         if (
@@ -512,13 +769,13 @@ class Trainer:
                 config_sha256=self.config_sha,
                 normalizer_sha256=self.normalizer_sha,
                 code_version=__version__,
-                extra={"kind": "best_mae", "val": rec, "ema": ema_sd, "source_sha": getattr(self, "source_sha", "")},
+                extra=self._ckpt_extra(kind="best_mae", val=rec),
             )
             self.logger.info("new best MAE=%.6f at step %s", self.best_mae, self.state.optimizer_step)
 
     def train(self, max_steps: Optional[int] = None) -> Dict[str, Any]:
         max_steps = max_steps if max_steps is not None else self.cfg.training.max_steps
-        self.system.train()
+        self._enter_train_mode()
         it = iter(self.train_loader)
         accum = self.cfg.training.grad_accum
         self.optimizer.zero_grad(set_to_none=True)
@@ -532,6 +789,10 @@ class Trainer:
         while self.state.optimizer_step < max_steps:
             loss_accum = 0.0
             last_diag: Dict[str, Any] = {}
+            last_loss_out = None
+            last_batch = None
+            if self.disc_optimizer is not None:
+                self.disc_optimizer.zero_grad(set_to_none=True)
             for _micro in range(accum):
                 try:
                     batch = next(it)
@@ -540,17 +801,45 @@ class Trainer:
                     it = iter(self.train_loader)
                     batch = next(it)
                 batch.hq = batch.hq.to(self.device, non_blocking=True)
+                last_micro = _micro == accum - 1
                 if self.use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         loss_out = self.system.task.forward_loss(
                             batch, optimizer_step=self.state.optimizer_step
                         )
-                        loss = loss_out.total / accum
+                    # Composer already forces FP32 pixel/structure terms.
+                    loss_out = self._attach_adv_g(loss_out, batch)
+                    last_diag.update(
+                        quantify_generator_losses(
+                            loss_out.unweighted,
+                            loss_out.weights,
+                            loss_out.weighted,
+                            total=loss_out.total,
+                        )
+                    )
+                    last_diag.update(self._maybe_influence(loss_out, last_micro))
+                    last_diag.update(self._backward_disc(loss_out, batch, accum))
+                    if self.discriminator is not None:
+                        self.discriminator.requires_grad_(False)
+                    loss = loss_out.total / accum
                     loss.backward()
                 else:
                     loss_out = self.system.task.forward_loss(
                         batch, optimizer_step=self.state.optimizer_step
                     )
+                    loss_out = self._attach_adv_g(loss_out, batch)
+                    last_diag.update(
+                        quantify_generator_losses(
+                            loss_out.unweighted,
+                            loss_out.weights,
+                            loss_out.weighted,
+                            total=loss_out.total,
+                        )
+                    )
+                    last_diag.update(self._maybe_influence(loss_out, last_micro))
+                    last_diag.update(self._backward_disc(loss_out, batch, accum))
+                    if self.discriminator is not None:
+                        self.discriminator.requires_grad_(False)
                     loss = loss_out.total / accum
                     loss.backward()
                 if not torch.isfinite(loss_out.total.detach()):
@@ -559,29 +848,41 @@ class Trainer:
                         f"samples={batch.sample_ids} sources={batch.sources}"
                     )
                 loss_accum += float(loss_out.total.detach().cpu())
-                last_diag = {
-                    k: float(v.detach().cpu()) if torch.is_tensor(v) and v.ndim == 0 else (
-                        v.detach().cpu().tolist() if torch.is_tensor(v) else v
-                    )
-                    for k, v in loss_out.diagnostics.items()
-                    if k
-                    in (
-                        "beta",
-                        "kl_mean",
-                        "active_unit_frac",
-                        "oor_hi_frac",
-                        "oor_lo_frac",
-                        "w_ms_ssim_effective",
-                    )
-                }
-                for name, t in loss_out.unweighted.items():
-                    last_diag[f"loss_raw_{name}"] = float(t.detach().cpu())
-                for name, t in loss_out.weighted.items():
-                    last_diag[f"loss_w_{name}"] = float(t.detach().cpu())
-                for name, w in loss_out.weights.items():
-                    last_diag[f"weight_{name}"] = float(w)
+                last_loss_out = loss_out
+                last_batch = batch
+                last_diag.update(
+                    {
+                        k: float(v.detach().cpu())
+                        for k, v in loss_out.diagnostics.items()
+                        if torch.is_tensor(v) and v.ndim == 0
+                    }
+                )
                 self.state.microbatch += 1
                 self.state.global_samples += batch.hq.shape[0]
+
+            # Standard GAN order: step D first (grads from detached fake), then G.
+            disc_pre = 0.0
+            if self.disc_optimizer is not None and self._adv_weight(self.state.optimizer_step) > 0:
+                has_d_grad = any(
+                    p.grad is not None for p in self.discriminator.parameters()
+                )
+                if has_d_grad:
+                    disc_clip = (
+                        self.cfg.loss.adversarial.grad_clip_norm
+                        if self.cfg.loss.adversarial.grad_clip_norm > 0
+                        else 1e9
+                    )
+                    disc_pre = float(
+                        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), disc_clip)
+                    )
+                    last_diag["grad_norm_disc_pre_clip"] = disc_pre
+                    self.disc_optimizer.step()
+                    if self.disc_scheduler is not None:
+                        self.disc_scheduler.step()
+                    if last_loss_out is not None and last_batch is not None:
+                        self._extra_critic_steps(last_loss_out, last_batch)
+                    self.disc_optimizer.zero_grad(set_to_none=True)
+                    self.discriminator.requires_grad_(True)
 
             pre_clip = float(
                 torch.nn.utils.clip_grad_norm_(
@@ -618,13 +919,15 @@ class Trainer:
                     "sampler_source_freq": self.train_sampler.realized_source_freq(),
                     "sampler_planned_probs": self.train_sampler.planned_source_probs(),
                 }
+                if self.disc_optimizer is not None:
+                    rec["lr_disc"] = self.disc_optimizer.param_groups[0]["lr"]
                 append_jsonl(self.run_dir / "metrics_train.jsonl", rec)
                 self.logger.info(
-                    "step=%s loss=%.6f lr=%.2e grad_pre=%.4f",
+                    "step=%s lr=%.2e idle=%.3f | %s",
                     self.state.optimizer_step,
-                    history[-1],
                     rec["lr"],
-                    pre_clip,
+                    last_diag.get("idle_frac", float("nan")),
+                    format_loss_breakdown(last_diag),
                 )
 
             if (
@@ -632,7 +935,7 @@ class Trainer:
                 and self.state.optimizer_step % self.cfg.training.val_every_steps == 0
             ):
                 self._maybe_validate()
-                self.system.train()
+                self._enter_train_mode()
 
             if self.state.optimizer_step % self.cfg.checkpoint.save_every_steps == 0:
                 # avoid duplicate file when step is also a candidate step
@@ -647,7 +950,7 @@ class Trainer:
                         config_sha256=self.config_sha,
                         normalizer_sha256=self.normalizer_sha,
                         code_version=__version__,
-                        extra={"ema": self.ema.state_dict() if self.ema else None},
+                        extra=self._ckpt_extra(),
                     )
                     self.ckpt.prune_periodic(keep_last=int(self.cfg.checkpoint.keep_last))
 
@@ -661,7 +964,7 @@ class Trainer:
             config_sha256=self.config_sha,
             normalizer_sha256=self.normalizer_sha,
             code_version=__version__,
-            extra={"ema": self.ema.state_dict() if self.ema else None},
+            extra=self._ckpt_extra(),
         )
         return {
             "final_step": self.state.optimizer_step,
@@ -724,11 +1027,11 @@ class Trainer:
                     recon = self.system.reconstruct_hq(batch.hq)
                     total += float((recon - batch.hq).abs().mean().cpu()) * batch.hq.shape[0]
                     count += batch.hq.shape[0]
-            self.system.train()
+            self._enter_train_mode()
             return total / max(count, 1)
 
         initial = _eval_mean()
-        self.system.train()
+        self._enter_train_mode()
         it = iter(loader)
         losses: List[float] = []
         max_steps = min(self.cfg.training.max_steps, 500)
@@ -743,10 +1046,26 @@ class Trainer:
                 it = iter(loader)
                 batch = next(it)
             batch.hq = batch.hq.to(self.device)
+            self.state.optimizer_step = step
             loss_out = self.system.task.forward_loss(batch, optimizer_step=step)
+            loss_out = self._attach_adv_g(loss_out, batch)
             if not torch.isfinite(loss_out.total.detach()):
                 raise RuntimeError(f"Non-finite overfit loss at step {step}")
+            if self.disc_optimizer is not None:
+                self.disc_optimizer.zero_grad(set_to_none=True)
+                self._backward_disc(loss_out, batch, 1)
+            if self.discriminator is not None:
+                self.discriminator.requires_grad_(False)
             loss_out.total.backward()
+            if self.disc_optimizer is not None and self._adv_weight(step) > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.discriminator.parameters(),
+                    self.cfg.loss.adversarial.grad_clip_norm
+                    if self.cfg.loss.adversarial.grad_clip_norm > 0
+                    else 1e9,
+                )
+                self.disc_optimizer.step()
+                self.disc_optimizer.zero_grad(set_to_none=True)
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             losses.append(float(loss_out.total.detach().cpu()))

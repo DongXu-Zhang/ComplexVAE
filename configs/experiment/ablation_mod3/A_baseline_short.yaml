@@ -1,16 +1,11 @@
-# S1 v2.1 — keep v2 architecture, fix HOW losses are applied.
-# One mechanism: spatially-supported structure (not a color-specific extra loss).
-#   - Filaments / puncta with spatial support: amp_norm + clipped edge + HF + Scharr.
-#   - Isolated spikes in flat regions (black OR grey): v1 path, no amplification.
-#   - Empty crops: no amp/edge/HF/Scharr; Charbonnier downweighted.
-# No extra dark-region loss term.
+# Mod3 ablation A: v2.1 losses only. Short run. Does not replace the formal 150k recipe.
 schema_version: microvae-config-v1
 experiment:
-  name: s1_hq_f4z4_v2_1
+  name: s1_hq_f4z4_v2_1_ablate_A_baseline_short
   route: hq_codec
-  output_dir: runs/s1_hq_f4z4_v2_1
+  output_dir: runs/ablation_mod3/A_baseline_short
   seed: 0
-  notes: "v2.1 pixel structure-support gate: amp/edge/HF only on spatially supported structure"
+  notes: "Mod3-A short baseline (no perc/GAN). Warmstart from v2.1 ckpt to isolate continue-training."
   allow_existing_output: false
 data:
   mode: hq_pool
@@ -82,6 +77,15 @@ loss:
   structure_support_rel: 0.25
   structure_support_min_density: 0.15
   structure_min_frac: 0.0003
+  perceptual:
+    enabled: false
+  adversarial:
+    enabled: false
+  influence:
+    log_contrib_ratio: true
+    grad_every_steps: 50
+    cosine_every_steps: 0
+    param_groups: [full]
 kl_schedule:
   t0: 2000
   t1: 25000
@@ -99,23 +103,24 @@ precision:
 memory:
   gradient_checkpointing: true
 training:
-  max_steps: 150000
+  max_steps: 2000
   microbatch_size: 4
   grad_accum: 2
   grad_clip_norm: 1.0
   ema_decay: 0.999
-  val_every_steps: 1000
-  log_every_steps: 50
-  candidate_steps: [30000, 60000, 90000, 120000, 150000]
+  val_every_steps: 200
+  log_every_steps: 20
+  candidate_steps: [2000]
   overfit_n_patches: 16
   num_workers: 4
+  warmstart_vae_path: null
 evaluation:
   allow_test: false
   use_ema_for_val: true
   use_posterior_mean: true
   extended_metrics: true
 checkpoint:
-  save_every_steps: 2000
+  save_every_steps: 500
   keep_last: 3
   keep_best_snr: true
   keep_best_mae: true

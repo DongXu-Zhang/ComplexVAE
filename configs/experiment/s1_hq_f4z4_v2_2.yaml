@@ -1,16 +1,12 @@
-# S1 v2.1 — keep v2 architecture, fix HOW losses are applied.
-# One mechanism: spatially-supported structure (not a color-specific extra loss).
-#   - Filaments / puncta with spatial support: amp_norm + clipped edge + HF + Scharr.
-#   - Isolated spikes in flat regions (black OR grey): v1 path, no amplification.
-#   - Empty crops: no amp/edge/HF/Scharr; Charbonnier downweighted.
-# No extra dark-region loss term.
+# S1 v2.2 — v2.1 + perceptual + GAN both ON (microscopy-adapted, not raw VGG/SRGAN).
+# v2.1 remains the no-perc/GAN comparison recipe. Do not overwrite it.
 schema_version: microvae-config-v1
 experiment:
-  name: s1_hq_f4z4_v2_1
+  name: s1_hq_f4z4_v2_2
   route: hq_codec
-  output_dir: runs/s1_hq_f4z4_v2_1
+  output_dir: runs/s1_hq_f4z4_v2_2
   seed: 0
-  notes: "v2.1 pixel structure-support gate: amp/edge/HF only on spatially supported structure"
+  notes: "v2.2: v2.1 + frozen 1-ch perceptual + unconditional PatchGAN hinge"
   allow_existing_output: false
 data:
   mode: hq_pool
@@ -82,6 +78,36 @@ loss:
   structure_support_rel: 0.25
   structure_support_min_density: 0.15
   structure_min_frac: 0.0003
+  perceptual:
+    enabled: true
+    weight: 0.05
+    start_step: 1000
+    ramp_steps: 1000
+    backbone: internal_conv
+    selected_layers: [block1, block2, block3]
+    distance: l1
+    apply_amp_norm: false
+    freeze: true
+    unstructured_policy: match_target
+    init_seed: 0
+  adversarial:
+    enabled: true
+    weight: 0.02
+    start_step: 5000
+    ramp_steps: 2000
+    architecture: patchgan
+    conditioning: none
+    gan_loss: hinge
+    spectral_norm: true
+    ndf: 32
+    n_layers: 3
+    n_critic: 1
+    unstructured_policy: exclude
+  influence:
+    log_contrib_ratio: true
+    grad_every_steps: 200
+    cosine_every_steps: 0
+    param_groups: [full]
 kl_schedule:
   t0: 2000
   t1: 25000

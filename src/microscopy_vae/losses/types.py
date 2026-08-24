@@ -13,3 +13,5 @@ class LossOutput:
     weights: Dict[str, float]
     weighted: Dict[str, torch.Tensor]
     diagnostics: Dict[str, torch.Tensor] = field(default_factory=dict)
+    # Non-logged tensors (support mask, recon) for GAN / influence. Not in jsonl.
+    aux: Dict[str, torch.Tensor] = field(default_factory=dict)

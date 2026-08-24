@@ -34,3 +34,30 @@ def validate_for_training(cfg: RootConfig) -> None:
     # route purity for S1
     if cfg.experiment.route != "hq_codec":
         raise ValueError("S1 configs must use experiment.route=hq_codec")
+    perc = cfg.loss.perceptual
+    if perc.enabled:
+        if not perc.freeze:
+            raise ValueError("perceptual.freeze must be true (trainable backbone is not supported)")
+        if perc.backbone == "vgg16" and not perc.vgg_repeat_channels:
+            raise ValueError("vgg16 requires perceptual.vgg_repeat_channels=true (explicit 1→3 repeat)")
+        if perc.weight < 0:
+            raise ValueError("perceptual.weight must be >= 0")
+        if perc.backbone == "internal_conv":
+            allowed = {f"block{i + 1}" for i in range(len(perc.channels))}
+            bad = [n for n in perc.selected_layers if n not in allowed]
+            if bad:
+                raise ValueError(
+                    f"perceptual.selected_layers {bad} not in internal_conv blocks {sorted(allowed)}"
+                )
+    adv = cfg.loss.adversarial
+    if adv.enabled:
+        if adv.n_critic < 1:
+            raise ValueError("adversarial.n_critic must be >= 1")
+        if adv.weight < 0:
+            raise ValueError("adversarial.weight must be >= 0")
+        if adv.conditioning == "input":
+            # allowed but degenerate for S1 (input==target); trainer logs a warning
+            pass
+    infl = cfg.loss.influence
+    if infl.grad_every_steps < 0 or infl.cosine_every_steps < 0:
+        raise ValueError("influence periods must be >= 0")

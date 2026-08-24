@@ -129,10 +129,12 @@ def test_v21_yaml_structure_gate_not_dark_loss():
     assert cfg.loss.structure_support_kernel == 9
     assert cfg.loss.structure_support_floor == 0.02
     assert cfg.loss.structure_support_min_density == 0.15
-    assert cfg.loss.structure_min_frac == 0.001
+    assert cfg.loss.structure_min_frac == 0.0003
     assert cfg.crop.min_robust_range == 0.08
     assert cfg.model.upsample_mode == "bilinear"
     assert cfg.evaluation.allow_test is False
+    assert cfg.loss.perceptual.enabled is False
+    assert cfg.loss.adversarial.enabled is False
 
 
 def test_v1_yaml_does_not_enable_pixel_gate():

@@ -7,8 +7,8 @@ from microscopy_vae.losses.structure import scharr_magnitude
 
 
 def per_sample_robust_range(target: torch.Tensor) -> torch.Tensor:
-    """Per-sample p99.5-p0.5, shape [B]."""
-    flat = target.reshape(target.shape[0], -1)
+    """Per-sample p99.5-p0.5, shape [B]. FP32 so quantile is safe under bf16 autocast."""
+    flat = target.float().reshape(target.shape[0], -1)
     hi = torch.quantile(flat, 0.995, dim=1)
     lo = torch.quantile(flat, 0.005, dim=1)
     return (hi - lo).clamp_min(0.0)
@@ -55,20 +55,20 @@ def structure_support_mask(
     k = int(kernel)
     if k % 2 == 0:
         raise ValueError(f"structure support kernel must be odd, got {k}")
-    mag = scharr_magnitude(target)
+    mag = scharr_magnitude(target)  # FP32
     tau = torch.clamp(
         mag.mean(dim=(1, 2, 3), keepdim=True) * float(rel),
         min=float(floor),
     )
-    high = (mag > tau).to(dtype=target.dtype)
+    high = (mag > tau).to(dtype=mag.dtype)
     pad = k // 2
     density = F.avg_pool2d(
         F.pad(high, (pad, pad, pad, pad), mode="reflect"),
         kernel_size=k,
         stride=1,
     )
-    dense_enough = (density >= float(min_density)).to(dtype=target.dtype)
-    return (high * dense_enough).detach()
+    dense_enough = (density >= float(min_density)).to(dtype=mag.dtype)
+    return (high * dense_enough).to(dtype=target.dtype).detach()
 
 
 def masked_spatial_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

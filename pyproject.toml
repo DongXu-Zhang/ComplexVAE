@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "microscopy-vae"
-version = "0.1.0"
+version = "0.2.5"
 description = "Scratch single-channel microscopy KL-VAE (HQ codec) — independent implementation"
 readme = "README.md"
 requires-python = ">=3.10"
