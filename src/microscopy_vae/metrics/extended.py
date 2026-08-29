@@ -208,6 +208,87 @@ def slice_metric_bundle(
     return bundle
 
 
+def _scharr_mag_np(image: np.ndarray) -> np.ndarray:
+    t = torch.from_numpy(np.ascontiguousarray(image, dtype=np.float32))[None, None]
+    from microscopy_vae.losses.structure import scharr_magnitude
+
+    return scharr_magnitude(t).numpy()[0, 0]
+
+
+def bright_edge_stats(
+    pred: np.ndarray,
+    target: np.ndarray,
+    *,
+    bright_q: float = 0.90,
+    tau: float = 0.02,
+) -> Dict[str, float]:
+    """Eval-only: Target-defined bright edges, under/over reconstruction."""
+    t = target.astype(np.float64)
+    p = pred.astype(np.float64)
+    mag = _scharr_mag_np(t)
+    tau_e = max(float(tau), 0.25 * float(mag.mean()))
+    edge = mag > tau_e
+    bright = t >= float(np.quantile(t, bright_q))
+    roi = edge & bright
+    n = int(roi.sum())
+    if n == 0:
+        return {
+            "bright_edge_n": 0.0,
+            "bright_under_frac": float("nan"),
+            "bright_over_frac": float("nan"),
+            "bright_retention": float("nan"),
+        }
+    d = p[roi] - t[roi]
+    t_m = float(t[roi].mean())
+    p_m = float(p[roi].mean())
+    return {
+        "bright_edge_n": float(n),
+        "bright_under_frac": float(np.mean((-d) > tau)),
+        "bright_over_frac": float(np.mean(d > tau)),
+        "bright_retention": float(p_m / (t_m + 1e-12)),
+    }
+
+
+def dark_structure_stats(
+    pred: np.ndarray,
+    target: np.ndarray,
+    *,
+    kernel: int = 9,
+) -> Dict[str, float]:
+    """Eval-only: gradient retention on Target-supported pixels below the median."""
+    t = target.astype(np.float32)
+    p = pred.astype(np.float32)
+    tt = torch.from_numpy(np.ascontiguousarray(t))[None, None]
+    from microscopy_vae.losses.pixel import structure_support_mask
+    from microscopy_vae.losses.structure import scharr_magnitude
+
+    support = structure_support_mask(tt, kernel=int(kernel)).numpy()[0, 0] > 0.5
+    dark = t <= float(np.median(t))
+    roi = support & dark
+    n = int(roi.sum())
+    mag_t = scharr_magnitude(tt).numpy()[0, 0]
+    mag_p = scharr_magnitude(torch.from_numpy(np.ascontiguousarray(p))[None, None]).numpy()[0, 0]
+    if n == 0:
+        return {
+            "dark_support_n": 0.0,
+            "dark_grad_retention": float("nan"),
+            "dark_intensity_retention": float("nan"),
+        }
+    gt = float(mag_t[roi].mean())
+    gp = float(mag_p[roi].mean())
+    it = float(t[roi].mean())
+    ip = float(p[roi].mean())
+    return {
+        "dark_support_n": float(n),
+        "dark_grad_retention": float(gp / (gt + 1e-12)),
+        "dark_intensity_retention": float(ip / (it + 1e-12)),
+    }
+
+
+def highlight_overshoot_frac(pred: np.ndarray, *, hi: float = 1.0) -> float:
+    return float(np.mean(pred.astype(np.float64) > float(hi)))
+
+
 def volume_pooled_psnr(
     slice_mses: Sequence[float],
     *,

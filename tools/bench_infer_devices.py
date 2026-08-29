@@ -33,10 +33,11 @@ def main() -> int:
     p.add_argument("--tile-size", type=int, default=256)
     p.add_argument("--overlap", type=int, default=32)
     p.add_argument("--repeat", type=int, default=3)
+    p.add_argument("--source", type=str, default=None)
     args = p.parse_args()
 
     from microscopy_vae.config.loader import load_config, resolved_dict
-    from microscopy_vae.data.normalization import NormalizationState, Normalizer
+    from microscopy_vae.data.normalization import NormalizationState, Normalizer, guess_source_from_path
     from microscopy_vae.data.readers import read_page
     from microscopy_vae.inference.compare import load_infer_weights
     from microscopy_vae.inference.devices import parse_devices
@@ -49,7 +50,9 @@ def main() -> int:
     all_dev = parse_devices("auto")
     page, _ = read_page(args.input, args.page)
     if args.normalizer:
-        x_np = Normalizer(NormalizationState.load(args.normalizer)).transform(page)
+        nrm = Normalizer(NormalizationState.load(args.normalizer))
+        src = args.source or guess_source_from_path(args.input, known=nrm.known_sources())
+        x_np = nrm.transform(page, source=src)
     else:
         x_np = page.astype(np.float32)
     x_cpu = torch.from_numpy(np.ascontiguousarray(x_np)).unsqueeze(0).unsqueeze(0)

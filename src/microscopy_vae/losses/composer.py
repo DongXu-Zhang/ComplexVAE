@@ -241,7 +241,10 @@ class HQCodecLossComposer:
                 l_hf = pred.new_zeros(())
         else:
             l_hf = pred.new_zeros(())
-        l_flux = flux_loss(pred, target)
+        if self.w_flux > 0:
+            l_flux = flux_loss(pred, target)
+        else:
+            l_flux = pred.new_zeros(())
         if self.w_dark_fp > 0:
             l_dark = dark_false_positive_loss(
                 pred, target, dark_quantile=self.dark_fp_quantile

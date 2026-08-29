@@ -13,7 +13,12 @@ from microscopy_vae.config.schema import RootConfig
 from microscopy_vae.config.validation import validate_for_training
 from microscopy_vae.data.hq_dataset import ManifestHQDataset, SyntheticHQDataset, collate_hq
 from microscopy_vae.data.manifest import load_hq_manifest, manifest_sha256, summarize_records
-from microscopy_vae.data.normalization import NormalizationState, Normalizer, fit_robust_normalizer
+from microscopy_vae.data.normalization import (
+    NormalizationState,
+    Normalizer,
+    assert_artifact_matches_config,
+    fit_robust_normalizer,
+)
 from microscopy_vae.data.readers import read_page
 from microscopy_vae.data.samplers import HierarchicalIndexSampler
 from microscopy_vae.data.synthetic import build_synthetic_hq_pool
@@ -30,6 +35,7 @@ from microscopy_vae.losses.influence import (
     quantify_generator_losses,
 )
 from microscopy_vae.losses.schedule import scheduled_weight
+from microscopy_vae.models.factory import architecture_id
 from microscopy_vae.systems.factory import build_hq_codec_system
 from microscopy_vae.utils.logging import append_jsonl, setup_logging
 from microscopy_vae.utils.rng import seed_everything
@@ -85,6 +91,12 @@ class Trainer:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.system = build_hq_codec_system(cfg).to(self.device)
+        self.logger.info(
+            "model architecture=%s spatial_compression=%s latent_channels=%s",
+            architecture_id(self.system.vae),
+            self.system.vae.spatial_compression,
+            self.system.vae.latent_channels,
+        )
         self.state = TrainerState()
         self.manifest_sha = "synthetic"
         self._test_loader_built = False  # invariant
@@ -157,6 +169,16 @@ class Trainer:
                 )
             self.manifest_sha = manifest_sha256(mpath)
             self.logger.info("Loaded HQ manifest: %s", summarize_records(records))
+            artifact_path = cfg.normalization.artifact_path
+            if artifact_path and not Path(artifact_path).is_file():
+                raise FileNotFoundError(
+                    f"normalization.artifact_path does not exist: {artifact_path}. "
+                    "Pass this run's normalizer.json; do not omit it and refit."
+                )
+            existing_norm = self.run_dir / "normalizer.json"
+            load_existing = bool(artifact_path) or (
+                bool(cfg.training.resume_exact_path) and existing_norm.is_file()
+            )
             # Fit normalizer on train pages only (subsample for memory)
             train_recs = [r for r in records if r.split == "train"]
             reachable = [r for r in train_recs if Path(r.hq_path).is_file()]
@@ -166,10 +188,12 @@ class Trainer:
                     f"train files are readable. Set data.path_prefix_target to the Linux mount "
                     f"of F:\\Dataset (see data_fix STATUS)."
                 )
-            if reachable:
+            if load_existing:
+                # Eval / resume: do not reread 192 train pages just to throw them away.
+                train_imgs, self._norm_sources = [], []
+            elif reachable:
                 train_imgs, self._norm_sources = self._sample_train_images_for_norm(reachable)
-            elif cfg.normalization.method == "identity" or cfg.normalization.artifact_path:
-                # Structure-only dry path: no pixels yet; identity or pre-fit artifact required
+            elif cfg.normalization.method == "identity":
                 import numpy as np
 
                 self.logger.warning(
@@ -210,12 +234,23 @@ class Trainer:
             )
 
         existing_norm = self.run_dir / "normalizer.json"
+        allow_legacy = bool(getattr(cfg.normalization, "allow_legacy_artifact", True))
+        if cfg.training.resume_exact_path and not (
+            (cfg.normalization.artifact_path and Path(cfg.normalization.artifact_path).is_file())
+            or existing_norm.is_file()
+        ):
+            raise FileNotFoundError(
+                "resume_exact requires this run's normalizer.json "
+                f"(missing {existing_norm}). Refusing to refit a new scale on resume."
+            )
         if cfg.normalization.artifact_path and Path(cfg.normalization.artifact_path).is_file():
             state = NormalizationState.load(Path(cfg.normalization.artifact_path))
+            assert_artifact_matches_config(state, cfg.normalization, allow_legacy=allow_legacy)
             self.normalizer_sha = state.save(self.run_dir / "normalizer.json")
         elif cfg.training.resume_exact_path and existing_norm.is_file():
             # resume: reuse the run's train-fitted normalizer (do not refit)
             state = NormalizationState.load(existing_norm)
+            assert_artifact_matches_config(state, cfg.normalization, allow_legacy=allow_legacy)
             self.normalizer_sha = state.save(existing_norm)
         else:
             method = cfg.normalization.method
@@ -229,18 +264,36 @@ class Trainer:
                 sources=self._norm_sources,
                 fit_mode=getattr(cfg.normalization, "fit_mode", "source_balanced"),
                 max_pixels_per_page=getattr(cfg.normalization, "max_pixels_per_page", 65536),
+                low_percentile=float(getattr(cfg.normalization, "low_percentile", 0.1)),
+                high_percentile=float(getattr(cfg.normalization, "high_percentile", 99.9)),
+                raw_floor_enabled=bool(getattr(cfg.normalization, "raw_floor_enabled", False)),
+                raw_floor_value=float(getattr(cfg.normalization, "raw_floor_value", 0.0)),
+                scale_mode=str(getattr(cfg.normalization, "scale_mode", "global")),
             )
             self.normalizer_sha = state.save(self.run_dir / "normalizer.json")
             self.logger.info(
-                "normalizer fit_mode=%s low=%.6g high=%.6g pages=%s",
+                "normalizer scale_mode=%s fit_mode=%s floor=%s p_high=%g low=%.6g high=%.6g pages=%s sources=%s",
+                state.scale_mode,
                 state.fit_mode,
+                state.raw_floor_enabled,
+                state.high_percentile,
                 state.low,
                 state.high,
                 state.n_pages_fit,
+                sorted(state.per_source_scales.keys()),
             )
         self.normalizer = Normalizer(state)
         if self.normalizer.state.fit_split != "train":
             raise RuntimeError("Normalizer fit_split must be train")
+        self._assert_per_source_coverage()
+        if self.normalizer.is_per_source():
+            for src, sc in sorted(self.normalizer.state.per_source_scales.items()):
+                self.logger.info(
+                    "per-source scale %s low=%.6g high=%.6g (y = max(x,0)/high)",
+                    src,
+                    float(sc["low"]),
+                    float(sc["high"]),
+                )
 
         crop_mode = str(getattr(cfg.crop, "mode", "random"))
         jitter = float(getattr(cfg.crop, "coverage_jitter_frac", 0.25))
@@ -328,6 +381,40 @@ class Trainer:
             collate_fn=collate_hq,
             pin_memory=pin,
         )
+
+    def _log_normalized_batch(self, batch) -> None:
+        x = batch.hq.detach().float()
+        self.logger.info(
+            "first-batch normalized hq min=%.5g max=%.5g mean=%.5g "
+            "frac_lt0=%.4g frac_gt1=%.4g sources=%s",
+            float(x.min()),
+            float(x.max()),
+            float(x.mean()),
+            float((x < -1e-6).float().mean()),
+            float((x > 1).float().mean()),
+            sorted(set(str(s) for s in batch.sources)),
+        )
+
+    def _assert_per_source_coverage(self) -> None:
+        """Fail at init if a train/val source has no fitted scale (would crash mid-epoch)."""
+        if not self.normalizer.is_per_source():
+            return
+        items = self._pages_or_records
+        needed = set()
+        for it in items:
+            split = getattr(it, "split", None)
+            if split in ("train", "val"):
+                needed.add(str(it.source))
+        fitted = set(self.normalizer.known_sources())
+        missing = needed - fitted
+        if missing:
+            raise ValueError(
+                "per-source normalizer is missing scales for "
+                f"{sorted(missing)}; fitted={sorted(fitted)}. "
+                "Those sources probably have no readable train files. "
+                "Set data.path_prefix_target to the Linux data root and "
+                "data.path_require_exists=true."
+            )
 
     def _sample_train_images_for_norm(
         self, train_recs, max_pages: Optional[int] = None
@@ -449,6 +536,9 @@ class Trainer:
             "source_sha": getattr(self, "source_sha", ""),
             "gan_enabled": self.discriminator is not None,
             "perc_enabled": self.system.perceptual is not None,
+            "spatial_compression": int(self.system.vae.spatial_compression),
+            "latent_channels": int(self.system.vae.latent_channels),
+            "architecture_id": architecture_id(self.system.vae),
         }
         if self.system.perceptual is not None:
             extra["perceptual"] = self.system.perceptual.state_dict()
@@ -801,6 +891,9 @@ class Trainer:
                     it = iter(self.train_loader)
                     batch = next(it)
                 batch.hq = batch.hq.to(self.device, non_blocking=True)
+                if not getattr(self, "_logged_norm_batch", False):
+                    self._log_normalized_batch(batch)
+                    self._logged_norm_batch = True
                 last_micro = _micro == accum - 1
                 if self.use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -1101,6 +1194,7 @@ class Trainer:
         audit = self.system.trainability_audit()
         batch = next(iter(self.train_loader))
         x = batch.hq[:1].to(self.device)
+        hq = batch.hq.detach().float()
         with torch.no_grad():
             out = self.system.vae(x, sample_posterior=False)
         return {
@@ -1115,6 +1209,12 @@ class Trainer:
             "manifest_sha256": self.manifest_sha,
             "device": str(self.device),
             "has_test_loader": hasattr(self, "test_loader"),
+            "normalizer_contract": self.normalizer.state.contract_dict(),
+            "batch_sources": list(batch.sources),
+            "batch_hq_min": float(hq.min()),
+            "batch_hq_max": float(hq.max()),
+            "batch_hq_frac_lt0": float((hq < -1e-6).float().mean()),
+            "batch_hq_frac_gt1": float((hq > 1).float().mean()),
             "capabilities": {
                 "hq_reconstruction": self.system.capabilities.hq_reconstruction,
                 "lr_encoding": self.system.capabilities.lr_encoding,

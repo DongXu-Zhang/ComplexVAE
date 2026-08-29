@@ -77,9 +77,10 @@ def _select_crop(
     min_robust_range: float,
     max_retries: int,
     allow_retry: bool,
+    source: str | None = None,
 ) -> tuple:
     crop = crop_fn(image, idx)
-    norm = normalizer.transform(crop)
+    norm = normalizer.transform(crop, source=source)
     if (not allow_retry) or min_robust_range <= 0:
         return crop, norm
     tries = max(int(max_retries), 1)
@@ -87,7 +88,7 @@ def _select_crop(
         if _normalized_robust_range(norm) >= min_robust_range:
             return crop, norm
         crop = crop_fn(image, idx)
-        norm = normalizer.transform(crop)
+        norm = normalizer.transform(crop, source=source)
     return crop, norm
 
 
@@ -164,6 +165,7 @@ class SyntheticHQDataset(Dataset):
             min_robust_range=self.min_robust_range,
             max_retries=self.max_range_retries,
             allow_retry=(not self.fixed_crops),
+            source=p.source,
         )
         tensor = torch.from_numpy(np.ascontiguousarray(norm)).unsqueeze(0)
         return {
@@ -264,6 +266,7 @@ class ManifestHQDataset(Dataset):
             min_robust_range=self.min_robust_range,
             max_retries=self.max_range_retries,
             allow_retry=(not self.fixed_crops),
+            source=r.source,
         )
         tensor = torch.from_numpy(np.ascontiguousarray(norm)).unsqueeze(0)
         return {

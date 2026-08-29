@@ -1,6 +1,6 @@
 # ComplexVAE — Scratch Microscopy HQ Codec
 
-Package version **0.2.5**. Single-channel **KL-VAE** for high-quality microscopy images:
+Package version **0.3.0**. Single-channel **KL-VAE** for high-quality microscopy images:
 
 ```text
 HQ image → Encoder → latent z → Decoder → reconstruction
@@ -12,16 +12,17 @@ HQ image → Encoder → latent z → Decoder → reconstruction
 
 Topology is *inspired by* Hybrid-SD Small / Diffusers 0.27 Encoder–Decoder structure (asymmetric channels, f8, z=4) but implemented independently under `src/microscopy_vae/`.
 
-**Next training (recommended):** `configs/experiment/s1_hq_f4z4_v2_2.yaml`  
-v2.1 structure-support gate plus microscopy-adapted perceptual + GAN (both ON). Keep `s1_hq_f4z4_v2_1.yaml` as the no-perc/GAN control; do not overwrite it. Frozen test split stays closed.
+**Official next train:** `configs/experiment/s1_hq_f8z4_v4.yaml` (V4 protocol, spatial compression 8, latent `4×32×32`). Same protocol at f4: `s1_hq_f4z4_v4.yaml`. Complete control (do not overwrite): `s1_hq_f4z4_v2_2.yaml`. Do not load f4 weights into f8 (`strict=False` is refused). Train f8 from scratch.
 
-## What 0.2.5 adds over GitHub `73d606b` (v2.1 gate only)
+V4: raw `max(x,0)`, then **per-source** train-only robust scales at p99.99. Independent Scharr/HF/Flux generator weights are 0; structure-support gate and Charbonnier edge weighting stay on. Infer with a path containing `BioTISR` / `DeepInsight_2D` / `DeepInsight_3D`, or pass `--source`. Frozen test split stays closed. Encode for LDM: `python -m microscopy_vae.cli encode ...` writes posterior mean in the **internal unscaled** domain; refit per-channel center/scale on **this** architecture's train latents (never reuse f4 stats on f8, never apply SD `0.18215`).
 
-1. **Structure-support pixel gate** (already in `73d606b`): stop fitting isolated speckle on dark/grey background without stacking a dark-only loss and without turning off amp/edge/HF on real filaments.
-2. **Inference modes:** `--inference-mode full|tiled|compare`. Tiled uses even tile origins (no last-tile snap overlap bug).
-3. **Perceptual + GAN:** frozen 1-channel conv perceptual; unconditional PatchGAN hinge. Schema defaults remain OFF; **v2.2 turns both ON**.
-4. **Loss quantification:** every generator term logs raw / weight / weighted contribution / share_pct.
-5. **Multi-GPU tiled inference:** `--devices auto|cuda:0|cuda:0,cuda:2` (1 / 2 / 3 / 4 GPUs). Full-image inference stays on one GPU.
+## What 0.3.0 adds over GitHub `78b59c9` (0.2.5)
+
+1. V4 normalizer: floor negatives to 0; per-source p99.99 (`y = max(x,0)/high_source`); `clip=false`.
+2. V4 losses: independent Scharr/HF/Flux weights 0; perc + GAN still on (start 1000 / 5000).
+3. Configurable f8: extra real stride-2 stage, architecture `microvae_f8_z4_enc128-256-512-512_dec96-192-384-384`.
+4. CLI `encode` / `decode` for LDM (unscaled posterior mean + pad metadata).
+5. Eval/compare require `--normalizer` and do not write into the training run dir.
 
 ## Install
 
@@ -43,53 +44,51 @@ pip install -e ".[dev]"
 pip install torch  # choose the correct CUDA wheel
 ```
 
-Confirm you are on **0.2.5**, not the older v2.1-only commit:
+Confirm you are on **0.3.0**:
 
 ```bash
 git log -1 --oneline
 python -c "import microscopy_vae; print(microscopy_vae.__version__)"
-ls configs/experiment/s1_hq_f4z4_v2_2.yaml
+ls configs/experiment/s1_hq_f8z4_v4.yaml
 ```
 
 ## Quick check (no real data)
 
 ```bash
 export PYTHONPATH=$PWD/src   # if not editable-installed
-python -m microscopy_vae.cli smoke-test --config configs/experiment/smoke_synthetic.yaml
-python -m microscopy_vae.cli smoke-test --config configs/experiment/smoke_gan_perc.yaml
-python -m pytest -q
+python -m microscopy_vae.cli smoke-test --config configs/experiment/smoke_f8.yaml
+python -m pytest -q tests/unit/test_v4_protocol.py tests/unit/test_f8_protocol.py
 ```
 
 ## Real HQ training (data on host)
 
 1. Place `hq_manifest_v2.jsonl` somewhere readable (not in git).
 2. Map Windows inventory paths to the host, e.g. `F:\Dataset\...` → `/data/Dataset/...`
-3. Train **v2.2** (perc + GAN on). `output_dir` must be empty:
+3. Train **f8/V4**. `output_dir` must be a **new empty** directory (do not write into f4 or v2.2 runs):
 
 ```bash
 python -m microscopy_vae.cli train \
-  --config configs/experiment/s1_hq_f4z4_v2_2.yaml \
-  --override data.mode=hq_pool \
+  --config configs/experiment/s1_hq_f8z4_v4.yaml \
   --override data.manifest_path=/data/inventory/hq_manifest_v2.jsonl \
   --override data.path_prefix_source='F:\\Dataset' \
   --override data.path_prefix_target=/data/Dataset \
   --override data.path_require_exists=true \
-  --override experiment.output_dir=/data/runs/s1_hq_f4z4_v2_2_seed0 \
+  --override experiment.output_dir=/data/runs/s1_hq_f8z4_v4_seed0 \
   --override experiment.seed=0
 ```
 
-Do **not** use the frozen test split. Do **not** overwrite a v2.1 run directory.
+Do **not** use the frozen test split. Do **not** load f4 checkpoints into f8.
 
-Perc starts contributing at step 1000; GAN at step 5000. Watch `metrics_train.jsonl` fields `share_pct_*` (generator terms sum to ~100%). Discriminator losses are separate.
+Logs must show `spatial_compression=8` and three per-source scales with `low=0`. Perc starts at step 1000; GAN at 5000; independent Scharr/HF/Flux stay at 0.0%.
 
 ## Inference
 
 Use the same config, EMA checkpoint, and `normalizer.json` from that run. Prefer tiled 256 first (matches training crop size); then `compare` vs full.
 
 ```bash
-CFG=configs/experiment/s1_hq_f4z4_v2_2.yaml
-CKPT=/data/runs/s1_hq_f4z4_v2_2_seed0/checkpoints/best_mae.pt
-NORM=/data/runs/s1_hq_f4z4_v2_2_seed0/normalizer.json
+CFG=configs/experiment/s1_hq_f8z4_v4.yaml
+CKPT=/data/runs/s1_hq_f8z4_v4_seed0/checkpoints/best_mae.pt
+NORM=/data/runs/s1_hq_f8z4_v4_seed0/normalizer.json
 
 # One GPU, tiles
 python -m microscopy_vae.cli infer --config $CFG --weights $CKPT --normalizer $NORM \
@@ -124,7 +123,7 @@ Do not assume more GPUs are always faster; measure on the target host.
 
 ```text
 src/microscopy_vae/   # package
-configs/              # YAML experiments (v2.1 control, v2.2 train)
+configs/              # YAML experiments (v2.2 control, V4 f4/f8 train)
 tools/                # manifest, loss tables, infer bench
 tests/                # unit + integration
 ```

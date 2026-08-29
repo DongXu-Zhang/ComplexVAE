@@ -43,6 +43,20 @@ hq_manifest*.jsonl
 slurm-*.out
 build_venv*.log
 
+# Local reproduction / handoff notes (keep off GitHub)
+*复现说明*.md
+V4_复现说明.md
+服务器交接*.md
+服务器开训*.md
+修改记录*.md
+*给后续AI*.md
+*给服务器*
+服务器GPT*
+*执行prompt*
+白点伪影*.md
+损失函数说明*.md
+上传服务器*.md
+
 # Data roots at repo top-level only (must stay offline)
 # NOTE: do NOT use a bare "data/" pattern — it would ignore src/microscopy_vae/data/
 /data/

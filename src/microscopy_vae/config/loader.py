@@ -20,6 +20,7 @@ def _deep_update(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, A
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
+    path = Path(path)
     text = path.read_text(encoding="utf-8")
     data = yaml.safe_load(text)
     if data is None:
@@ -45,14 +46,31 @@ def resolved_dict(cfg: RootConfig) -> Dict[str, Any]:
     return cfg.model_dump(mode="json")
 
 
+def canonical_resolved_dict(cfg: RootConfig) -> Dict[str, Any]:
+    """Identity of a run for resume_exact.
+
+    `training.resume_exact_path` and `experiment.allow_existing_output` are
+    how a later process points at the same run; they must not change the hash
+    stored in checkpoints.
+    """
+    d = resolved_dict(cfg)
+    tr = dict(d.get("training") or {})
+    tr["resume_exact_path"] = None
+    d["training"] = tr
+    exp = dict(d.get("experiment") or {})
+    exp["allow_existing_output"] = False
+    d["experiment"] = exp
+    return d
+
+
 def dump_resolved(cfg: RootConfig, path: Path) -> str:
+    """Write the full resolved YAML (including resume path) and return the semantic hash."""
     text = yaml.safe_dump(resolved_dict(cfg), sort_keys=True, default_flow_style=False)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
-    return sha256_text(text)
+    return config_semantic_hash(cfg)
 
 
 def config_semantic_hash(cfg: RootConfig) -> str:
-    # Exclude pure logging verbosity later if needed; for now full dump.
-    payload = json.dumps(resolved_dict(cfg), sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(canonical_resolved_dict(cfg), sort_keys=True, separators=(",", ":"))
     return sha256_text(payload)

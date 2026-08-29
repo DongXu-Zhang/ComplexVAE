@@ -14,6 +14,53 @@ from microscopy_vae.utils.atomic import atomic_write_bytes
 CHECKPOINT_FORMAT = "microvae-ckpt-v1"
 
 
+def _architecture_mismatch_message(model: torch.nn.Module, extra: Optional[Dict[str, Any]], err: BaseException) -> str:
+    model_f = getattr(model, "spatial_compression", None)
+    model_z = getattr(model, "latent_channels", None)
+    ckpt_f = None
+    ckpt_z = None
+    ckpt_arch = None
+    if isinstance(extra, dict):
+        ckpt_f = extra.get("spatial_compression")
+        ckpt_z = extra.get("latent_channels")
+        ckpt_arch = extra.get("architecture_id")
+    return (
+        f"strict weight load failed (model f{model_f}/z{model_z}; "
+        f"checkpoint f{ckpt_f}/z{ckpt_z} architecture={ckpt_arch}). "
+        "f4 and f8 have different downsample/upsample stages — do not load with "
+        "strict=False. Train f8 from scratch (or load matching-architecture weights). "
+        f"Original error: {err}"
+    )
+
+
+def assert_architecture_compatible(model: torch.nn.Module, extra: Optional[Dict[str, Any]]) -> None:
+    """Refuse f4↔f8 (or z-mismatch) before touching parameters."""
+    if not isinstance(extra, dict):
+        return
+    model_f = getattr(model, "spatial_compression", None)
+    model_z = getattr(model, "latent_channels", None)
+    ckpt_f = extra.get("spatial_compression")
+    ckpt_z = extra.get("latent_channels")
+    if ckpt_f is not None and model_f is not None and int(ckpt_f) != int(model_f):
+        raise RuntimeError(
+            f"Refusing to load f{int(ckpt_f)} weights into an f{int(model_f)} model. "
+            "The extra downsample/upsample stage is not a resample of 4×64×64. "
+            "Train the f8 model from scratch."
+        )
+    if ckpt_z is not None and model_z is not None and int(ckpt_z) != int(model_z):
+        raise RuntimeError(
+            f"Refusing to load z{int(ckpt_z)} weights into a z{int(model_z)} model."
+        )
+
+
+def load_vae_state_dict(model: torch.nn.Module, state: Dict[str, Any], *, extra: Optional[Dict[str, Any]] = None) -> None:
+    assert_architecture_compatible(model, extra)
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(_architecture_mismatch_message(model, extra, exc)) from exc
+
+
 def _torch_load(path: Path, map_location: str = "cpu") -> Any:
     """Load checkpoint with weights_only when supported (PyTorch >= 2.0 safer default)."""
     try:
@@ -131,7 +178,7 @@ class CheckpointManager:
             raise ValueError(
                 f"code_version mismatch: ckpt={payload.get('code_version')} current={expected_code_version}"
             )
-        model.load_state_dict(payload["model"])
+        load_vae_state_dict(model, payload["model"], extra=payload.get("extra") or {})
         optimizer.load_state_dict(payload["optimizer"])
         if scheduler is not None and payload.get("scheduler") is not None:
             scheduler.load_state_dict(payload["scheduler"])
@@ -145,10 +192,9 @@ class CheckpointManager:
     def load_exported_weights(path: Path, model: torch.nn.Module, map_location: str = "cpu") -> None:
         payload = _torch_load(path, map_location=map_location)
         if isinstance(payload, dict) and "model" in payload:
-            # Allow full ckpt for inference but mark not for training resume without checks
-            model.load_state_dict(payload["model"])
+            load_vae_state_dict(model, payload["model"], extra=payload.get("extra") or {})
         elif isinstance(payload, dict):
-            model.load_state_dict(payload)
+            load_vae_state_dict(model, payload, extra=None)
         else:
             raise ValueError("Unrecognized weights file")
 
@@ -170,7 +216,7 @@ class StageTransitionLoader:
             raise ValueError("stage_transition requires project checkpoint format")
         state = payload["model"]
         # For S1 core we only support full load of VAE weights as parent.
-        model.load_state_dict(state, strict=True)
+        load_vae_state_dict(model, state, extra=payload.get("extra") or {})
         if freeze_modules:
             for name, p in model.named_parameters():
                 if any(name.startswith(m) for m in freeze_modules):

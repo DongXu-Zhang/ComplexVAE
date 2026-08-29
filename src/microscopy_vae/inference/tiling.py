@@ -285,6 +285,72 @@ def reconstruct_full(
 
 
 @torch.no_grad()
+def encode_full(
+    model,
+    x: torch.Tensor,
+    *,
+    spatial_compression: int,
+    padding_mode: str = "reflect",
+    sample_posterior: bool = False,
+) -> Tuple[torch.Tensor, Any, Dict[str, Any]]:
+    """Pad to f, encode, return (latent, posterior, metadata).
+
+    Default latent is posterior mean (LDM / eval). Domain is the model's
+    internal unscaled z — do not apply SD 0.18215.
+    """
+    if x.ndim != 4 or x.shape[1] != 1:
+        raise ValueError(f"expected [B,1,H,W], got {tuple(x.shape)}")
+    want_f = int(getattr(model, "spatial_compression", spatial_compression))
+    if int(spatial_compression) != want_f:
+        raise ValueError(
+            f"spatial_compression={spatial_compression} does not match model f{want_f}"
+        )
+    x_pad, pads = pad_to_multiple(x, spatial_compression, mode=padding_mode)
+    posterior = model.encode(x_pad)
+    z = model.sample_latent(posterior, sample=bool(sample_posterior))
+    from microscopy_vae.models.factory import architecture_id
+
+    arch = architecture_id(model)
+    aux = {
+        "mode": "encode_full",
+        "input_hw": [int(x.shape[-2]), int(x.shape[-1])],
+        "padded_hw": [int(x_pad.shape[-2]), int(x_pad.shape[-1])],
+        "pad_hw": [int(pads[0]), int(pads[1])],
+        "latent_shape": [int(d) for d in z.shape],
+        "latent_hw": [int(z.shape[-2]), int(z.shape[-1])],
+        "spatial_compression": int(spatial_compression),
+        "latent_channels": int(z.shape[1]),
+        "posterior": "sample" if sample_posterior else "mean",
+        "domain": "internal_unscaled",
+        "padding_mode": padding_mode,
+        "sd_scaling_factor": False,
+        "architecture_id": arch,
+    }
+    return z, posterior, aux
+
+
+@torch.no_grad()
+def decode_full(
+    model,
+    z: torch.Tensor,
+    *,
+    pad_hw: Tuple[int, int] = (0, 0),
+    output_hw: Optional[Tuple[int, int]] = None,
+) -> torch.Tensor:
+    """Decode internal latent and crop padding back to the original H×W."""
+    if z.ndim != 4:
+        raise ValueError(f"expected [B,C,h,w] latent, got {tuple(z.shape)}")
+    y = model.decode(z)
+    y = unpad(y, (int(pad_hw[0]), int(pad_hw[1])))
+    if output_hw is not None:
+        oh, ow = int(output_hw[0]), int(output_hw[1])
+        y = y[..., :oh, :ow]
+        if y.shape[-2] != oh or y.shape[-1] != ow:
+            raise RuntimeError(f"decode shape {tuple(y.shape[-2:])} != requested {(oh, ow)}")
+    return y
+
+
+@torch.no_grad()
 def reconstruct_one_tile(
     model,
     tile: torch.Tensor,

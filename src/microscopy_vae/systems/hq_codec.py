@@ -45,6 +45,32 @@ class HQCodecSystem(nn.Module):
         z = self.vae.sample_latent(post, generator=generator, sample=sample_posterior)
         return post, z
 
+    def encode_page(self, hq: torch.Tensor, *, padding_mode: str = "reflect", sample_posterior: bool = False):
+        """Pad to f, encode. Returns (latent, posterior, metadata). Default = posterior mean."""
+        from microscopy_vae.inference.tiling import encode_full
+
+        return encode_full(
+            self.vae,
+            hq,
+            spatial_compression=int(self.vae.spatial_compression),
+            padding_mode=padding_mode,
+            sample_posterior=sample_posterior,
+        )
+
+    def decode_page(
+        self,
+        z: torch.Tensor,
+        *,
+        pad_hw=(0, 0),
+        output_hw=None,
+        output_domain: str = "normalized",
+    ) -> torch.Tensor:
+        from microscopy_vae.inference.tiling import decode_full
+
+        if output_domain != "normalized":
+            raise ValueError("Only normalized domain decode in core; inverse norm is caller's job")
+        return decode_full(self.vae, z, pad_hw=pad_hw, output_hw=output_hw)
+
     def decode_hq(self, z: torch.Tensor, *, output_domain: str = "normalized") -> torch.Tensor:
         if output_domain != "normalized":
             raise ValueError("Only normalized domain decode in core; inverse norm is caller's job")

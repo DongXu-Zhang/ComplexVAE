@@ -4,11 +4,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from microscopy_vae.config.loader import load_config
 from microscopy_vae.engine.checkpoint import CheckpointManager
 from microscopy_vae.engine.trainer import Trainer
+
+
+def test_smoke_v4_train_no_test_loader(tmp_path):
+    cfg_path = Path(__file__).resolve().parents[2] / "configs" / "experiment" / "smoke_v4.yaml"
+    cfg = load_config(cfg_path, overrides={"experiment": {"output_dir": str(tmp_path / "run")}})
+    trainer = Trainer(cfg)
+    assert not hasattr(trainer, "test_loader")
+    assert cfg.loss.w_grad == 0.0
+    result = trainer.train(max_steps=2)
+    assert result["final_step"] == 2
+    assert np.isfinite(float(result["final_loss"]))
 
 
 def test_smoke_gan_perc_train_and_resume(tmp_path):

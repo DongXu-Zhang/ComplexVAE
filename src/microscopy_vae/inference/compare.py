@@ -214,8 +214,10 @@ def load_infer_weights(path: Path, model: torch.nn.Module, *, use_ema: bool = Tr
     if not isinstance(payload, dict):
         raise ValueError("Unrecognized weights file")
     if "model" in payload:
-        model.load_state_dict(payload["model"])
         extra = payload.get("extra") or {}
+        from microscopy_vae.engine.checkpoint import load_vae_state_dict
+
+        load_vae_state_dict(model, payload["model"], extra=extra if isinstance(extra, dict) else None)
         ema_sd = extra.get("ema") if isinstance(extra, dict) else None
         if use_ema and isinstance(ema_sd, dict) and ema_sd:
             ema = EMA(model, decay=0.999)
@@ -223,5 +225,7 @@ def load_infer_weights(path: Path, model: torch.nn.Module, *, use_ema: bool = Tr
             ema.copy_to(model)
             return "ema"
         return "model"
-    model.load_state_dict(payload)
+    from microscopy_vae.engine.checkpoint import load_vae_state_dict
+
+    load_vae_state_dict(model, payload, extra=None)
     return "state_dict"

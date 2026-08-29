@@ -37,9 +37,11 @@ class DataConfig(BaseModel):
 
 class NormalizationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    method: Literal["robust_linear_p0.1_p99.9", "identity"] = "robust_linear_p0.1_p99.9"
+    # robust_linear_p0.1_p99.9 is the locked V1/V2 name (percentiles must stay 0.1/99.9).
+    # robust_linear uses low_percentile/high_percentile (V4).
+    method: Literal["robust_linear_p0.1_p99.9", "robust_linear", "identity"] = "robust_linear_p0.1_p99.9"
     fit_split: Literal["train"] = "train"
-    # Linear-head codec: keep negatives and the p0.1/p99.9 tails (do NOT clip to [0,1]).
+    # Linear-head codec: keep tails (do NOT clip to [0,1]).
     clip: bool = False
     ssim_data_range: float = 1.0
     artifact_path: Optional[str] = None
@@ -47,6 +49,30 @@ class NormalizationConfig(BaseModel):
     fit_mode: Literal["source_balanced", "page_uniform"] = "source_balanced"
     max_pages_fit: int = 192
     max_pixels_per_page: int = 65536
+    low_percentile: float = 0.1
+    high_percentile: float = 99.9
+    # Raw intensity floor applied before fit and transform. Off = V2.2 behaviour.
+    raw_floor_enabled: bool = False
+    raw_floor_value: float = 0.0
+    # global: one affine for all sources. per_source: train-only (low, high) per source.
+    scale_mode: Literal["global", "per_source"] = "global"
+    # If false, refuse to load an artifact whose floor/percentiles differ from this config.
+    allow_legacy_artifact: bool = True
+
+    @model_validator(mode="after")
+    def percentile_contract(self) -> "NormalizationConfig":
+        if not (0.0 <= float(self.low_percentile) < float(self.high_percentile) <= 100.0):
+            raise ValueError(
+                f"Need 0 <= low_percentile < high_percentile <= 100, "
+                f"got {self.low_percentile}/{self.high_percentile}"
+            )
+        if self.method == "robust_linear_p0.1_p99.9":
+            if abs(self.low_percentile - 0.1) > 1e-12 or abs(self.high_percentile - 99.9) > 1e-12:
+                raise ValueError(
+                    "method robust_linear_p0.1_p99.9 is locked to p0.1/p99.9; "
+                    "use method=robust_linear for custom percentiles"
+                )
+        return self
 
 
 class SamplingConfig(BaseModel):
@@ -102,6 +128,17 @@ class ModelConfig(BaseModel):
         if v != 1:
             raise ValueError("only single-channel models are allowed")
         return v
+
+    @model_validator(mode="after")
+    def encoder_decoder_stage_count(self) -> "ModelConfig":
+        n_enc = len(self.encoder_block_out_channels)
+        n_dec = len(self.decoder_block_out_channels)
+        if n_enc != n_dec:
+            raise ValueError(
+                f"encoder/decoder stage counts must match "
+                f"(got enc={n_enc} dec={n_dec}); spatial_compression = 2**(n_stages-1)"
+            )
+        return self
 
 
 class LatentConfig(BaseModel):
@@ -295,6 +332,13 @@ class EvaluationConfig(BaseModel):
     report_constant_baseline: bool = True
     max_bootstrap: int = 200  # cap for wall-clock; full n_resamples only if smaller
     extended_metrics: bool = False
+    # Post-hoc report only (eval-val-report). Not training losses.
+    severe_mae_unit: float = 0.10
+    severe_bg_fp_rate: float = 0.15
+    severe_bg_bias: float = 0.02
+    severe_bright_retention: float = 0.50
+    severe_dark_grad_retention: float = 0.40
+    worst_n: int = 20
 
 
 class BootstrapConfig(BaseModel):
