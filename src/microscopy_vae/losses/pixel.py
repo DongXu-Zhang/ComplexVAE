@@ -18,20 +18,36 @@ def per_sample_robust_scale(
     target: torch.Tensor,
     *,
     min_scale: float = 0.05,
-    low_structure_range: float = 0.0,
+    low_structure_range: float | torch.Tensor = 0.0,
     low_structure_scale: float = 1.0,
+    smooth: bool = False,
 ) -> torch.Tensor:
     """Per-sample divisor for amp_norm, shape [B,1,1,1].
 
     Default (low_structure_range=0) matches v2: s = max(range, min_scale).
     If range < low_structure_range, use low_structure_scale instead of amplifying
     empty / near-black patches (that was producing white speckle on dark bg).
+    ``low_structure_range`` may be a per-sample tensor [B].
     """
     rng = per_sample_robust_range(target)
     s = rng.clamp_min(min_scale)
-    if low_structure_range > 0:
-        idle = rng < float(low_structure_range)
-        s = torch.where(idle, s.new_full(s.shape, float(low_structure_scale)), s)
+    if torch.is_tensor(low_structure_range):
+        thr = low_structure_range.to(device=rng.device, dtype=rng.dtype).reshape(-1)
+    else:
+        thr = rng.new_full(rng.shape, float(low_structure_range))
+    if bool((thr > 0).any()):
+        s_amp = rng.clamp_min(min_scale)
+        s_idle = s.new_full(s.shape, float(low_structure_scale))
+        if smooth:
+            lo = 0.5 * thr
+            hi = thr.clamp_min(1e-8)
+            alpha = ((rng - lo) / (hi - lo)).clamp(0.0, 1.0)
+            alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+            s = s_idle * (1.0 - alpha) + s_amp * alpha
+        else:
+            idle = (thr > 0) & (rng < thr)
+            s = torch.where(idle, s_idle, s_amp)
+        s = torch.where(thr > 0, s, s_amp)
     return s.view(-1, 1, 1, 1)
 
 
@@ -39,7 +55,7 @@ def structure_support_mask(
     target: torch.Tensor,
     *,
     kernel: int = 9,
-    floor: float = 0.02,
+    floor: float | torch.Tensor = 0.02,
     rel: float = 0.25,
     min_density: float = 0.15,
 ) -> torch.Tensor:
@@ -56,10 +72,14 @@ def structure_support_mask(
     if k % 2 == 0:
         raise ValueError(f"structure support kernel must be odd, got {k}")
     mag = scharr_magnitude(target)  # FP32
-    tau = torch.clamp(
-        mag.mean(dim=(1, 2, 3), keepdim=True) * float(rel),
-        min=float(floor),
-    )
+    rel_tau = mag.mean(dim=(1, 2, 3), keepdim=True) * float(rel)
+    if torch.is_tensor(floor):
+        fl = floor.to(device=mag.device, dtype=mag.dtype)
+        if fl.ndim == 1:
+            fl = fl.view(-1, 1, 1, 1)
+        tau = torch.maximum(rel_tau, fl)
+    else:
+        tau = torch.clamp(rel_tau, min=float(floor))
     high = (mag > tau).to(dtype=mag.dtype)
     pad = k // 2
     density = F.avg_pool2d(

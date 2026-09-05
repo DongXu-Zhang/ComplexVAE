@@ -1,0 +1,170 @@
+# S1 V5 recommended train. Independent of s1_hq_f8z4_v4 (frozen control).
+# clip=false. Per-source p99.99 + train-fitted crop/support/amp thresholds.
+schema_version: microvae-config-v1
+experiment:
+  name: s1_hq_f8z4_v5
+  route: hq_codec
+  output_dir: runs/s1_hq_f8z4_v5
+  seed: 0
+  notes: "V5 recommended: per-source p99.99, clip=false, calibrated crop/support/amp gates, empty_keep_prob=0.55, amp_smooth, soft MS-SSIM/perc leak. Do not reuse a V4 normalizer.json. Halo infer is CLI-only."
+  allow_existing_output: false
+data:
+  mode: hq_pool
+  manifest_path: null
+  allow_splits: [train, val]
+  path_prefix_source: "F:\\Dataset"
+  path_prefix_target: null
+  path_require_exists: false
+normalization:
+  method: robust_linear
+  fit_split: train
+  clip: false
+  ssim_data_range: 1.0
+  fit_mode: source_balanced
+  max_pages_fit: 192
+  max_pixels_per_page: 65536
+  low_percentile: 0.0
+  high_percentile: 99.99
+  raw_floor_enabled: true
+  raw_floor_value: 0.0
+  scale_mode: per_source
+  allow_legacy_artifact: false
+  calibrate_thresholds: true
+  threshold_bg_quantile: 0.20
+  threshold_bg_scharr_q: 90.0
+  threshold_empty_range_q: 90.0
+  threshold_struct_range_q: 10.0
+  threshold_crops_per_page: 4
+sampling:
+  strategy: source_group_page
+  source_weight_mode: sqrt_groups
+  slice_weight_mode: focus_softmax
+  focus_sidecar_path: null
+  focus_temperature: 0.7
+  focus_min_keep: 0.15
+  focus_compute_if_missing: true
+crop:
+  size: 256
+  mode: coverage_jitter
+  coverage_jitter_frac: 0.25
+  min_robust_range: 0.08
+  max_range_retries: 4
+  empty_keep_prob: 0.55
+model:
+  in_channels: 1
+  out_channels: 1
+  latent_channels: 4
+  encoder_block_out_channels: [128, 256, 512, 512]
+  decoder_block_out_channels: [96, 192, 384, 384]
+  layers_per_block: 2
+  norm_num_groups: 32
+  mid_block_add_attention: true
+  output_activation: linear
+  upsample_mode: bilinear
+  downsample_pad_mode: symmetric
+  downsample_preblur: true
+initialization:
+  mode: fresh_init
+task:
+  name: hq_codec
+  sample_posterior: true
+loss:
+  w_char: 1.0
+  w_ms_ssim: 0.12
+  w_grad: 0.0
+  w_flux: 0.0
+  w_hf: 0.0
+  w_dark_fp: 0.0
+  free_nats: 0.5
+  ms_ssim_start_step: 1000
+  ms_ssim_ramp_steps: 500
+  amp_norm: true
+  amp_norm_min_scale: 0.20
+  amp_low_structure_range: 0.08
+  amp_low_structure_scale: 1.0
+  amp_smooth: true
+  unstructured_bg_weight: 0.25
+  idle_loss_mult: 0.25
+  edge_weight: 0.75
+  edge_weight_clip: 3.0
+  ssim_range_mode: amp_space
+  structure_support_kernel: 9
+  structure_support_floor: 0.02
+  structure_support_rel: 0.25
+  structure_support_min_density: 0.15
+  structure_min_frac: 0.0003
+  perceptual:
+    enabled: true
+    weight: 0.05
+    start_step: 1000
+    ramp_steps: 1000
+    backbone: internal_conv
+    selected_layers: [block1, block2, block3]
+    distance: l1
+    apply_amp_norm: false
+    freeze: true
+    unstructured_policy: match_target
+    init_seed: 0
+  adversarial:
+    enabled: true
+    weight: 0.02
+    start_step: 5000
+    ramp_steps: 2000
+    architecture: patchgan
+    conditioning: none
+    gan_loss: hinge
+    spectral_norm: true
+    ndf: 32
+    n_layers: 3
+    n_critic: 1
+    unstructured_policy: exclude
+  influence:
+    log_contrib_ratio: true
+    grad_every_steps: 200
+    cosine_every_steps: 0
+    param_groups: [full]
+kl_schedule:
+  t0: 2000
+  t1: 25000
+  beta_max: 0.008
+optimizer:
+  name: adamw
+  lr: 0.00008
+  weight_decay: 0.0001
+scheduler:
+  name: cosine
+  warmup_steps: 1000
+  min_lr: 0.000001
+precision:
+  amp_dtype: bf16
+memory:
+  gradient_checkpointing: true
+training:
+  max_steps: 150000
+  microbatch_size: 4
+  grad_accum: 2
+  grad_clip_norm: 1.0
+  ema_decay: 0.999
+  val_every_steps: 1000
+  log_every_steps: 50
+  candidate_steps: [30000, 60000, 90000, 120000, 150000]
+  overfit_n_patches: 16
+  num_workers: 4
+evaluation:
+  allow_test: false
+  use_ema_for_val: true
+  use_posterior_mean: true
+  extended_metrics: true
+  severe_mae_unit: 0.10
+  severe_bg_fp_rate: 0.15
+  severe_bg_bias: 0.02
+  severe_bright_retention: 0.50
+  severe_dark_grad_retention: 0.40
+  worst_n: 20
+checkpoint:
+  save_every_steps: 2000
+  keep_last: 3
+  keep_best_snr: true
+  keep_best_mae: true
+logging:
+  level: INFO

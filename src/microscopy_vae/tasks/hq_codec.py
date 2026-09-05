@@ -27,4 +27,4 @@ class HQCodecTask:
     def forward_loss(self, batch: HQBatch, *, optimizer_step: int) -> LossOutput:
         x = batch.hq
         out = self.model(x, sample_posterior=self.sample_posterior)
-        return self.loss(out, x, optimizer_step=optimizer_step)
+        return self.loss(out, x, optimizer_step=optimizer_step, sources=list(batch.sources))

@@ -58,6 +58,15 @@ class NormalizationConfig(BaseModel):
     scale_mode: Literal["global", "per_source"] = "global"
     # If false, refuse to load an artifact whose floor/percentiles differ from this config.
     allow_legacy_artifact: bool = True
+    # Train-only per-source crop/support/amp thresholds in *normalized* space.
+    # Off = use yaml scalars (V2/V4). On = fit into normalizer.json and refuse
+    # artifacts that lack the threshold contract.
+    calibrate_thresholds: bool = False
+    threshold_bg_quantile: float = 0.20
+    threshold_bg_scharr_q: float = 90.0
+    threshold_empty_range_q: float = 90.0
+    threshold_struct_range_q: float = 10.0
+    threshold_crops_per_page: int = 4
 
     @model_validator(mode="after")
     def percentile_contract(self) -> "NormalizationConfig":
@@ -99,6 +108,9 @@ class CropConfig(BaseModel):
     # Train-only: retry a crop if normalized robust range is below this. 0 disables.
     min_robust_range: float = 0.0
     max_range_retries: int = 8
+    # If a crop is below the range gate, keep it with this probability instead of
+    # retrying (so dark/empty tiles still appear in training). 0 = V4 always retry.
+    empty_keep_prob: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class ModelConfig(BaseModel):
@@ -244,6 +256,10 @@ class LossConfig(BaseModel):
     # 0 disables the guard (legacy v2 behaviour that over-weighted empty patches).
     amp_low_structure_range: float = 0.0
     amp_low_structure_scale: float = 1.0
+    # Smooth the idle↔amp transition instead of a hard cut at amp_low_structure_range.
+    amp_smooth: bool = False
+    # MS-SSIM / perceptual background leak: 0 = old match_target (zero error off support).
+    unstructured_bg_weight: float = Field(default=0.0, ge=0.0, le=1.0)
     # extra weight on |∇target|-weighted Charbonnier; 0 keeps v1 behaviour.
     edge_weight: float = 0.0
     # 0 = no clip (legacy). v2.1 uses 3.0 so isolated noise cannot get huge weights.
@@ -321,6 +337,11 @@ class TrainingConfig(BaseModel):
     # Load VAE weights only (step/optim reset). For ablation warm-start from our
     # own S1 checkpoint. Mutually exclusive with resume_exact_path. Not ImageNet.
     warmstart_vae_path: Optional[str] = None
+    # DDP: default splits yaml microbatch*accum across ranks (same global batch).
+    # True keeps per-device microbatch and *multiplies* global batch by world_size.
+    ddp_scale_global_batch: bool = False
+    # Optional LR multiply by world_size. Requires ddp_scale_global_batch.
+    ddp_scale_lr: bool = False
 
 
 class EvaluationConfig(BaseModel):
@@ -432,6 +453,8 @@ class RootConfig(BaseModel):
             raise ValueError("only fresh_init or explicit resume_exact_path allowed")
         if self.training.resume_exact_path and self.training.warmstart_vae_path:
             raise ValueError("resume_exact_path and warmstart_vae_path are mutually exclusive")
+        if self.training.ddp_scale_lr and not self.training.ddp_scale_global_batch:
+            raise ValueError("training.ddp_scale_lr requires training.ddp_scale_global_batch=true")
         if self.evaluation.allow_test:
             raise ValueError("evaluation.allow_test must be false until freeze-candidate credentials")
         if "test" in self.data.allow_splits:

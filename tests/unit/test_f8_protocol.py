@@ -385,7 +385,11 @@ def test_f8_cli_encode_decode_roundtrip(tmp_path, monkeypatch):
     latent = tmp_path / "latent.npy"
     recon = tmp_path / "recon.npy"
     common = dict(
-        override=[],
+        override=[
+            "normalization.method=identity",
+            "normalization.scale_mode=global",
+            "normalization.raw_floor_enabled=false",
+        ],
         print_resolved_config=False,
         dry_run=False,
         weights=str(weights),

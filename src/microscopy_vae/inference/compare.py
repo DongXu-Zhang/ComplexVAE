@@ -128,7 +128,7 @@ def run_full_tiled_compare(
     devices: Optional[list] = None,
     cfg_dump: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """x is already globally normalized [1,1,H,W]. target defaults to x (self-recon)."""
+    """x is already normalized [1,1,H,W] (per-source or global). target defaults to x."""
     tgt = target if target is not None else x
     t0 = time.perf_counter()
     full, full_aux = reconstruct_full(

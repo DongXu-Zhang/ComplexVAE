@@ -10,6 +10,7 @@ from microscopy_vae.data.normalization import Normalizer
 from microscopy_vae.data.readers import read_page
 from microscopy_vae.data.records import HQBatch, HQPageRecord
 from microscopy_vae.data.synthetic import SyntheticPage
+from microscopy_vae.data.threshold_calibration import crop_range_accept
 
 
 def take_crop(
@@ -23,16 +24,21 @@ def take_crop(
     jitter_frac: float,
     cell_hits: Dict[int, np.ndarray],
     draw_counter: Callable[[], int],
+    last_cell: Optional[list] = None,
 ) -> np.ndarray:
     h, w = img.shape
     cs = crop_size
     if h < cs or w < cs:
         raise ValueError(f"image {h}x{w} smaller than crop {cs} for idx={idx}")
     if fixed:
+        if last_cell is not None:
+            last_cell.clear()
         y0 = (h - cs) // 2
         x0 = (w - cs) // 2
         return img[y0 : y0 + cs, x0 : x0 + cs]
     if mode != "coverage_jitter":
+        if last_cell is not None:
+            last_cell.clear()
         rng = np.random.default_rng(seed + idx * 9973)
         y0 = int(rng.integers(0, h - cs + 1))
         x0 = int(rng.integers(0, w - cs + 1))
@@ -51,6 +57,8 @@ def take_crop(
     pick = cands[int(rng.integers(0, len(cands)))]
     cy, cx = int(pick[0]), int(pick[1])
     hits[cy, cx] += 1
+    if last_cell is not None:
+        last_cell[:] = [idx, cy, cx]
     base_y = int(round(cy * (h - cs) / max(ny - 1, 1))) if ny > 1 else 0
     base_x = int(round(cx * (w - cs) / max(nx - 1, 1))) if nx > 1 else 0
     jitter = int(round(cs * max(jitter_frac, 0.0)))
@@ -68,6 +76,22 @@ def _normalized_robust_range(norm: np.ndarray) -> float:
     return float(hi - lo)
 
 
+def _undo_coverage_hit(
+    cell_hits: Optional[Dict[int, np.ndarray]],
+    last_cell: Optional[list],
+) -> None:
+    """Rejected empty retries must not mark a coarse cell as already covered."""
+    if not cell_hits or not last_cell or len(last_cell) != 3:
+        return
+    idx, cy, cx = int(last_cell[0]), int(last_cell[1]), int(last_cell[2])
+    hits = cell_hits.get(idx)
+    if hits is None:
+        return
+    if 0 <= cy < hits.shape[0] and 0 <= cx < hits.shape[1]:
+        hits[cy, cx] = max(int(hits[cy, cx]) - 1, 0)
+    last_cell.clear()
+
+
 def _select_crop(
     image: np.ndarray,
     idx: int,
@@ -78,15 +102,29 @@ def _select_crop(
     max_retries: int,
     allow_retry: bool,
     source: str | None = None,
+    empty_keep_prob: float = 0.0,
+    cell_hits: Optional[Dict[int, np.ndarray]] = None,
+    last_cell: Optional[list] = None,
 ) -> tuple:
     crop = crop_fn(image, idx)
     norm = normalizer.transform(crop, source=source)
-    if (not allow_retry) or min_robust_range <= 0:
+    thr = float(min_robust_range)
+    if hasattr(normalizer, "threshold_for"):
+        thr = float(normalizer.threshold_for(source, "crop_min_robust_range", thr))
+    if (not allow_retry) or thr <= 0:
         return crop, norm
+    keep_p = float(empty_keep_prob)
+    rng = np.random.default_rng(int(idx) * 7919 + 13)
     tries = max(int(max_retries), 1)
-    for _ in range(tries - 1):
-        if _normalized_robust_range(norm) >= min_robust_range:
+    for attempt in range(tries):
+        if crop_range_accept(_normalized_robust_range(norm), thr):
             return crop, norm
+        # Dark/empty crop: keep some so the decoder sees black at train time.
+        if keep_p > 0 and float(rng.random()) < keep_p:
+            return crop, norm
+        if attempt == tries - 1:
+            return crop, norm
+        _undo_coverage_hit(cell_hits, last_cell)
         crop = crop_fn(image, idx)
         norm = normalizer.transform(crop, source=source)
     return crop, norm
@@ -108,6 +146,7 @@ class SyntheticHQDataset(Dataset):
         coverage_jitter_frac: float = 0.25,
         min_robust_range: float = 0.0,
         max_range_retries: int = 8,
+        empty_keep_prob: float = 0.0,
     ) -> None:
         if split == "test":
             raise RuntimeError("Refuse to construct test dataset without freeze credentials")
@@ -122,8 +161,10 @@ class SyntheticHQDataset(Dataset):
         self.coverage_jitter_frac = float(coverage_jitter_frac)
         self.min_robust_range = float(min_robust_range)
         self.max_range_retries = int(max_range_retries)
+        self.empty_keep_prob = float(empty_keep_prob)
         self._cell_hits: Dict[int, np.ndarray] = {}
         self._coverage_draws = 0
+        self._last_cell: list = []
         # public metadata for hierarchical sampler
         self.meta = [
             {
@@ -149,6 +190,7 @@ class SyntheticHQDataset(Dataset):
             jitter_frac=self.coverage_jitter_frac,
             cell_hits=self._cell_hits,
             draw_counter=lambda: self._bump_coverage(),
+            last_cell=self._last_cell,
         )
 
     def _bump_coverage(self) -> int:
@@ -166,6 +208,9 @@ class SyntheticHQDataset(Dataset):
             max_retries=self.max_range_retries,
             allow_retry=(not self.fixed_crops),
             source=p.source,
+            empty_keep_prob=self.empty_keep_prob,
+            cell_hits=self._cell_hits,
+            last_cell=self._last_cell,
         )
         tensor = torch.from_numpy(np.ascontiguousarray(norm)).unsqueeze(0)
         return {
@@ -199,6 +244,7 @@ class ManifestHQDataset(Dataset):
         coverage_jitter_frac: float = 0.25,
         min_robust_range: float = 0.0,
         max_range_retries: int = 8,
+        empty_keep_prob: float = 0.0,
     ) -> None:
         if split == "test":
             raise RuntimeError("Refuse to construct test dataset without freeze credentials")
@@ -216,8 +262,10 @@ class ManifestHQDataset(Dataset):
         self.coverage_jitter_frac = float(coverage_jitter_frac)
         self.min_robust_range = float(min_robust_range)
         self.max_range_retries = int(max_range_retries)
+        self.empty_keep_prob = float(empty_keep_prob)
         self._cell_hits: Dict[int, np.ndarray] = {}
         self._coverage_draws = 0
+        self._last_cell: list = []
         self.meta = [
             {
                 "source": r.source,
@@ -242,6 +290,7 @@ class ManifestHQDataset(Dataset):
             jitter_frac=self.coverage_jitter_frac,
             cell_hits=self._cell_hits,
             draw_counter=lambda: self._bump_coverage(),
+            last_cell=self._last_cell,
         )
 
     def _bump_coverage(self) -> int:
@@ -267,6 +316,9 @@ class ManifestHQDataset(Dataset):
             max_retries=self.max_range_retries,
             allow_retry=(not self.fixed_crops),
             source=r.source,
+            empty_keep_prob=self.empty_keep_prob,
+            cell_hits=self._cell_hits,
+            last_cell=self._last_cell,
         )
         tensor = torch.from_numpy(np.ascontiguousarray(norm)).unsqueeze(0)
         return {

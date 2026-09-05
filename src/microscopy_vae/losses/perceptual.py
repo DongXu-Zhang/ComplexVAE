@@ -219,6 +219,7 @@ def perceptual_feature_loss(
     normalize_features: bool = False,
     unstructured_policy: str = "keep",
     support: Optional[torch.Tensor] = None,
+    unstructured_bg_weight: float = 0.0,
     vgg_adapter_kwargs: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Feature distance. `pred`/`target` already in the chosen intensity domain.
@@ -238,8 +239,10 @@ def perceptual_feature_loss(
         "perc_clamped": pred_f.new_zeros(()),
     }
     if unstructured_policy == "match_target" and support is not None:
-        m = support.to(dtype=pred_f.dtype)
-        pred_f = torch.where(m > 0, pred_f, tgt_f)
+        m = (support.to(dtype=pred_f.dtype) > 0).to(pred_f.dtype)
+        lam = float(unstructured_bg_weight)
+        w = m + lam * (1.0 - m)
+        pred_f = w * pred_f + (1.0 - w) * tgt_f
     elif unstructured_policy not in ("keep", "match_target"):
         raise ValueError(f"unknown unstructured_policy={unstructured_policy!r}")
 

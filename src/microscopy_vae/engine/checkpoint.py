@@ -91,10 +91,13 @@ class CheckpointManager:
         code_version: str,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Path:
+        from microscopy_vae.engine.distributed import strip_module_prefix, unwrap_module
+
+        raw = unwrap_module(model)
         payload = {
             "format": CHECKPOINT_FORMAT,
             "mode": "resume_exact",
-            "model": model.state_dict(),
+            "model": strip_module_prefix(raw.state_dict()),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "scaler": scaler.state_dict() if scaler is not None else None,
@@ -178,7 +181,13 @@ class CheckpointManager:
             raise ValueError(
                 f"code_version mismatch: ckpt={payload.get('code_version')} current={expected_code_version}"
             )
-        load_vae_state_dict(model, payload["model"], extra=payload.get("extra") or {})
+        from microscopy_vae.engine.distributed import strip_module_prefix, unwrap_module
+
+        load_vae_state_dict(
+            unwrap_module(model),
+            strip_module_prefix(payload["model"]),
+            extra=payload.get("extra") or {},
+        )
         optimizer.load_state_dict(payload["optimizer"])
         if scheduler is not None and payload.get("scheduler") is not None:
             scheduler.load_state_dict(payload["scheduler"])
@@ -190,11 +199,16 @@ class CheckpointManager:
 
     @staticmethod
     def load_exported_weights(path: Path, model: torch.nn.Module, map_location: str = "cpu") -> None:
+        from microscopy_vae.engine.distributed import strip_module_prefix, unwrap_module
+
         payload = _torch_load(path, map_location=map_location)
+        raw = unwrap_module(model)
         if isinstance(payload, dict) and "model" in payload:
-            load_vae_state_dict(model, payload["model"], extra=payload.get("extra") or {})
+            load_vae_state_dict(
+                raw, strip_module_prefix(payload["model"]), extra=payload.get("extra") or {}
+            )
         elif isinstance(payload, dict):
-            load_vae_state_dict(model, payload, extra=None)
+            load_vae_state_dict(raw, strip_module_prefix(payload), extra=None)
         else:
             raise ValueError("Unrecognized weights file")
 

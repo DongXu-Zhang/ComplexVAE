@@ -63,6 +63,9 @@ class NormalizationState:
     # global: one (low, high) for all sources. per_source: each source has its own.
     scale_mode: str = "global"
     per_source_scales: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    # Train-fitted crop/support/amp thresholds in normalized space (V5).
+    per_source_thresholds: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    threshold_version: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -96,6 +99,9 @@ class NormalizationState:
             "raw_floor_value": float(self.raw_floor_value),
             "scale_mode": str(self.scale_mode),
             "sources": sorted(self.per_source_scales.keys()),
+            "threshold_version": str(self.threshold_version or ""),
+            "threshold_sources": sorted(self.per_source_thresholds.keys()),
+            "floor_before_normalize": bool(self.raw_floor_enabled),
         }
 
 
@@ -126,6 +132,15 @@ class Normalizer:
 
     def known_sources(self) -> List[str]:
         return sorted(self.state.per_source_scales.keys())
+
+    def threshold_for(self, source: Optional[str], key: str, default: float) -> float:
+        """Per-source calibrated threshold, else yaml/default scalar."""
+        table = self.state.per_source_thresholds or {}
+        if source is not None and str(source) in table:
+            rec = table[str(source)] or {}
+            if key in rec:
+                return float(rec[key])
+        return float(default)
 
     def scale_for(self, source: Optional[str]) -> Tuple[float, float]:
         if not self.is_per_source():
@@ -314,6 +329,12 @@ def fit_robust_normalizer(
     if scale_mode_u == "per_source" and (sources is None or len(sources) != len(arrays)):
         raise ValueError("scale_mode=per_source requires a source label for every fit array")
 
+    frac_neg_raw: Dict[str, List[float]] = defaultdict(list)
+    if sources is not None:
+        for a, s in zip(arrays, sources):
+            arr = np.asarray(a, dtype=np.float32)
+            frac_neg_raw[str(s)].append(float((arr < 0).mean()))
+
     if scale_mode_u == "per_source":
         by_src: Dict[str, List[np.ndarray]] = defaultdict(list)
         for a, s in zip(arrays, sources or []):
@@ -334,6 +355,7 @@ def fit_robust_normalizer(
             per_source_scales[s] = {"low": lo, "high": hi}
             y = (f - lo) / (hi - lo + 1e-8)
             n_above = int((f > hi).sum())
+            neg_list = frac_neg_raw.get(s) or []
             per_source_stats[s] = {
                 "low": lo,
                 "high": hi,
@@ -341,6 +363,7 @@ def fit_robust_normalizer(
                 "n_pixels_fit": int(f.size),
                 "n_pixels_above_high": n_above,
                 "frac_above_high": float(n_above / max(f.size, 1)),
+                "frac_neg_before_floor": float(np.mean(neg_list)) if neg_list else 0.0,
                 "mean": float(f.mean()),
                 "std": float(f.std()),
                 "min": float(f.min()),
@@ -517,18 +540,39 @@ def summarize_percentile_candidates(
             ),
             "per_source_after_global_map": per_src_map,
         }
+    per_source_linear: Dict[str, Any] = {}
+    for s, flist in sorted(by_src.items()):
+        f = np.concatenate(flist)
+        hi = float(np.percentile(f, 99.99))
+        hi = max(hi, 1e-8)
+        y = f / hi
+        n_gt1 = int((y > 1).sum())
+        per_source_linear[s] = {
+            "high_p99.99": hi,
+            "norm_mean": float(y.mean()),
+            "norm_p50": float(np.percentile(y, 50)),
+            "norm_p90": float(np.percentile(y, 90)),
+            "norm_p99": float(np.percentile(y, 99)),
+            "frac_gt1_clip_false": float(n_gt1 / max(f.size, 1)),
+            "frac_clipped_if_clip_true": float(n_gt1 / max(f.size, 1)),
+            "frac_lt0": float((y < 0).mean()),
+        }
+
     return {
         "raw_floor_enabled": bool(raw_floor_enabled),
         "raw_floor_value": float(raw_floor_value),
         "low_percentile": float(low_percentile),
         "candidates": [float(c) for c in candidates],
         "per_source": src_tables,
+        "per_source_linear_p99_99": per_source_linear,
         "source_balanced_globals": globals_out,
         "note": (
             "With three sources, source-balanced global high is the median of "
             "per-source highs. Raising the percentile only moves the global high "
             "if the middle source's high moves; the brightest source can still "
-            "exceed 1 after mapping."
+            "exceed 1 after mapping. V4/V5 transform uses per-source high, not "
+            "the global median. clip=false keeps frac_gt1 as linear tail; "
+            "clip=true would flatten those pixels to 1 and is not the default."
         ),
     }
 
@@ -546,11 +590,14 @@ def assert_artifact_matches_config(state: NormalizationState, cfg_norm: Any, *, 
     got_high = float(state.high_percentile)
     want_scale = str(getattr(cfg_norm, "scale_mode", "global"))
     got_scale = str(getattr(state, "scale_mode", "global"))
+    want_clip = bool(getattr(cfg_norm, "clip", False))
+    got_clip = bool(getattr(state, "clip", False))
     mismatch = (
         got_floor != want_floor
         or abs(got_low - want_low) > 1e-9
         or abs(got_high - want_high) > 1e-9
         or want_scale != got_scale
+        or want_clip != got_clip
     )
     cfg_id = method == IDENTITY_METHOD
     art_id = state.method == IDENTITY_METHOD
@@ -558,13 +605,19 @@ def assert_artifact_matches_config(state: NormalizationState, cfg_norm: Any, *, 
         mismatch = True
     if want_scale == "per_source" and not state.per_source_scales:
         mismatch = True
+    want_thr = bool(getattr(cfg_norm, "calibrate_thresholds", False))
+    got_thr = bool(getattr(state, "per_source_thresholds", None))
+    if want_thr and not (got_thr and str(getattr(state, "threshold_version", ""))):
+        mismatch = True
     if mismatch and not allow_legacy:
         raise ValueError(
             "Normalizer artifact does not match config contract "
             f"(cfg floor={want_floor} p{want_low:g}/{want_high:g} method={method} "
-            f"scale_mode={want_scale}; "
+            f"scale_mode={want_scale} clip={want_clip} calibrate_thresholds={want_thr}; "
             f"artifact floor={got_floor} p{got_low:g}/{got_high:g} method={state.method} "
-            f"scale_mode={got_scale} transform_id={state.transform_id}). "
+            f"scale_mode={got_scale} clip={got_clip} "
+            f"threshold_version={getattr(state, 'threshold_version', '')!r} "
+            f"transform_id={state.transform_id}). "
             "Refusing silent mix. Pass the artifact from the same run, or set "
             "normalization.allow_legacy_artifact=true."
         )

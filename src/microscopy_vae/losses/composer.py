@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -70,6 +70,8 @@ class HQCodecLossComposer:
         perc_normalize_features: bool = False,
         perc_backbone: str = "internal_conv",
         perc_vgg_kwargs: Optional[dict] = None,
+        unstructured_bg_weight: float = 0.0,
+        amp_smooth: bool = False,
     ) -> None:
         self.w_char = w_char
         self.w_ms_ssim = w_ms_ssim
@@ -111,6 +113,41 @@ class HQCodecLossComposer:
         self.perc_normalize_features = bool(perc_normalize_features)
         self.perc_backbone = str(perc_backbone)
         self.perc_vgg_kwargs = perc_vgg_kwargs
+        self.unstructured_bg_weight = float(unstructured_bg_weight)
+        self.amp_smooth = bool(amp_smooth)
+        self.per_source_thresholds: Dict[str, Dict[str, float]] = {}
+
+    def set_calibrated_thresholds(self, table: Optional[Dict[str, Dict[str, float]]]) -> None:
+        yaml_amp = float(self.amp_low_structure_range)
+        out: Dict[str, Dict[str, float]] = {}
+        for k, v in (table or {}).items():
+            rec = dict(v)
+            # Never amplify more aggressively than the yaml amp gate.
+            if yaml_amp > 0:
+                rec["amp_low_structure_range"] = max(
+                    float(rec.get("amp_low_structure_range", yaml_amp)), yaml_amp
+                )
+            out[str(k)] = rec
+        self.per_source_thresholds = out
+
+    def _per_source_tensor(
+        self,
+        sources: Optional[Sequence[str]],
+        key: str,
+        default: float,
+        *,
+        bsz: int,
+        device,
+        dtype,
+    ) -> torch.Tensor:
+        vals = []
+        for i in range(bsz):
+            src = None
+            if sources is not None and i < len(sources):
+                src = str(sources[i])
+            rec = self.per_source_thresholds.get(src or "", {})
+            vals.append(float(rec.get(key, default)))
+        return torch.tensor(vals, device=device, dtype=dtype)
 
     def _ms_weight(self, optimizer_step: int) -> float:
         if optimizer_step < self.ms_ssim_start_step:
@@ -128,6 +165,7 @@ class HQCodecLossComposer:
         *,
         optimizer_step: int,
         mask: Optional[torch.Tensor] = None,
+        sources: Optional[Sequence[str]] = None,
     ) -> LossOutput:
         # Pixel/structure terms in FP32 even when the trainer autocasts bf16.
         pred = output.reconstruction.float()
@@ -136,10 +174,26 @@ class HQCodecLossComposer:
         bsz = int(target.shape[0])
         dtype = pred.dtype
         rng = per_sample_robust_range(target)
+        floor_b = self._per_source_tensor(
+            sources,
+            "structure_support_floor",
+            self.structure_support_floor,
+            bsz=bsz,
+            device=target.device,
+            dtype=target.dtype,
+        )
+        amp_thr_b = self._per_source_tensor(
+            sources,
+            "amp_low_structure_range",
+            self.amp_low_structure_range,
+            bsz=bsz,
+            device=target.device,
+            dtype=rng.dtype,
+        )
         support = structure_support_mask(
             target,
             kernel=self.structure_support_kernel,
-            floor=self.structure_support_floor,
+            floor=floor_b.view(bsz, 1, 1, 1),
             rel=self.structure_support_rel,
             min_density=self.structure_support_min_density,
         )
@@ -153,8 +207,8 @@ class HQCodecLossComposer:
         idle = torch.zeros(bsz, dtype=torch.bool, device=target.device)
         if self.structure_min_frac > 0:
             idle = idle | (support_frac < float(self.structure_min_frac))
-        elif self.amp_low_structure_range > 0:
-            idle = idle | (rng < float(self.amp_low_structure_range))
+        elif float(self.amp_low_structure_range) > 0 or bool(self.per_source_thresholds):
+            idle = idle | ((amp_thr_b > 0) & (rng < amp_thr_b))
         active = (~idle).to(dtype=dtype)
         # Pixel gate is off on idle crops (v1 path: no edge/HF/Scharr boost).
         support_on = support * active.view(bsz, 1, 1, 1)
@@ -165,8 +219,9 @@ class HQCodecLossComposer:
             scale = per_sample_robust_scale(
                 target,
                 min_scale=self.amp_norm_min_scale,
-                low_structure_range=self.amp_low_structure_range,
+                low_structure_range=amp_thr_b,
                 low_structure_scale=self.amp_low_structure_scale,
+                smooth=self.amp_smooth,
             )
             # Support-idle crops must not be amplified even if a handful of
             # isolated spikes inflate P99.5 enough to pass the range floor.
@@ -210,7 +265,11 @@ class HQCodecLossComposer:
             # neighbourhood. On unstructured pixels, copy target into pred so
             # SSIM cannot reward matching (or penalize not matching) noise.
             if self.structure_support_kernel > 1:
-                pred_ms = torch.where(support_on > 0, pred_ms, tgt_ms)
+                # lambda=0: copy target off-support (old). lambda>0: leak pred error.
+                lam = float(self.unstructured_bg_weight)
+                mix = (support_on > 0).to(pred_ms.dtype)
+                w = mix + lam * (1.0 - mix)
+                pred_ms = w * pred_ms + (1.0 - w) * tgt_ms
             l_ms_ps = ms_ssim_loss(pred_ms, tgt_ms, data_range=ms_range, reduce=False)
             if float(active.sum()) > 0:
                 l_ms = (l_ms_ps * active).sum() / active.sum()
@@ -275,6 +334,7 @@ class HQCodecLossComposer:
                     normalize_features=self.perc_normalize_features,
                     unstructured_policy=self.perc_unstructured_policy,
                     support=support_on if self.structure_support_kernel > 1 else None,
+                    unstructured_bg_weight=self.unstructured_bg_weight,
                     vgg_adapter_kwargs=vgg_kw,
                 )
 

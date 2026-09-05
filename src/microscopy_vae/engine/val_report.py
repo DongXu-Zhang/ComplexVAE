@@ -53,15 +53,31 @@ def to_raw_nonneg(
 
 
 def default_unit_scale(state: NormalizationState) -> float:
-    """Common intensity divisor after inverse + floor.
+    """Shared divisor for *cross-run* compare (one number for both models).
 
-    Per-source V4: use the brightest source's (high-low), otherwise DI3D
-    reconstructions sit far above 1 and pred_gt1_frac looks like failure.
-    Global V2.2: high-low of the single fitted line.
+    Per-source: brightest source span. Do not use this as the within-run
+    eval-val-report default — that would shrink Bio/DI2D MAE by H_src/H_max.
     """
     if str(getattr(state, "scale_mode", "global")) == "per_source" and state.per_source_scales:
         spans = [float(sc["high"]) - float(sc["low"]) for sc in state.per_source_scales.values()]
         return max(max(spans), 1e-8)
+    return max(float(state.high) - float(state.low), 1e-8)
+
+
+def source_unit_scale(
+    state: Optional[NormalizationState],
+    source: Optional[str],
+    *,
+    fallback: float = 1.0,
+) -> float:
+    """Per-page divisor: that source's (high-low). Makes Bio/DI2D/DI3D MAE comparable."""
+    if state is None:
+        return max(float(fallback), 1e-8)
+    if str(getattr(state, "scale_mode", "global")) == "per_source" and state.per_source_scales:
+        if source is not None and str(source) in state.per_source_scales:
+            sc = state.per_source_scales[str(source)]
+            return max(float(sc["high"]) - float(sc["low"]), 1e-8)
+        return default_unit_scale(state)
     return max(float(state.high) - float(state.low), 1e-8)
 
 
@@ -128,14 +144,18 @@ def collect_val_pages(
     *,
     device: torch.device,
     normalizer: Optional[Normalizer],
-    unit_scale: float,
+    unit_scale: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """One row per val crop. Input tensors are already normalized by the dataset.
 
     Caller must load EMA (or raw) weights into `system` before calling.
+    ``unit_scale=None`` → each source uses its own (high-low). Pass a float
+    only for compare-runs that need one shared divisor.
     """
     system.eval()
     rows: List[Dict[str, Any]] = []
+    state = None if normalizer is None else normalizer.state
+    fallback = default_unit_scale(state) if state is not None else 1.0
     for batch in loader:
         x = batch.hq.to(device, non_blocking=True)
         recon = system.reconstruct_hq(x)
@@ -146,8 +166,13 @@ def collect_val_pages(
             src = batch.sources[i]
             tgt_raw = to_raw_nonneg(xi, normalizer, is_raw=False, source=src)
             pred_raw = to_raw_nonneg(ri, normalizer, is_raw=False, source=src)
-            tgt_u = to_common_unit(tgt_raw, unit_scale)
-            pred_u = to_common_unit(pred_raw, unit_scale)
+            scale_i = (
+                float(unit_scale)
+                if unit_scale is not None
+                else source_unit_scale(state, src, fallback=fallback)
+            )
+            tgt_u = to_common_unit(tgt_raw, scale_i)
+            pred_u = to_common_unit(pred_raw, scale_i)
             m = pair_eval_metrics(pred_u, tgt_u, data_range=1.0)
             m_raw = {
                 "mae_raw": mae_np(pred_raw, tgt_raw),
@@ -163,6 +188,7 @@ def collect_val_pages(
                     "transform_id": meta.get("transform_id"),
                     "metrics_unit": m,
                     "metrics_raw": m_raw,
+                    "unit_scale": float(scale_i),
                 }
             )
     return rows

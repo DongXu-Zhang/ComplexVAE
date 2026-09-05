@@ -1,0 +1,118 @@
+# Tiny synthetic smoke for V5 (per-source + calibrated thresholds).
+schema_version: microvae-config-v1
+experiment:
+  name: smoke_v5
+  route: hq_codec
+  output_dir: runs/smoke_v5
+  seed: 0
+  allow_existing_output: true
+data:
+  mode: synthetic
+  synthetic_n_groups: 4
+  synthetic_pages_per_group: 2
+  synthetic_size: 64
+normalization:
+  method: robust_linear
+  fit_split: train
+  clip: false
+  fit_mode: source_balanced
+  low_percentile: 0.0
+  high_percentile: 99.99
+  raw_floor_enabled: true
+  raw_floor_value: 0.0
+  scale_mode: per_source
+  allow_legacy_artifact: false
+  calibrate_thresholds: true
+crop:
+  size: 64
+  min_robust_range: 0.08
+  empty_keep_prob: 0.55
+model:
+  in_channels: 1
+  out_channels: 1
+  latent_channels: 4
+  encoder_block_out_channels: [32, 64, 64, 64]
+  decoder_block_out_channels: [32, 64, 64, 64]
+  layers_per_block: 1
+  norm_num_groups: 8
+  mid_block_add_attention: false
+  output_activation: linear
+  upsample_mode: bilinear
+  downsample_pad_mode: symmetric
+  downsample_preblur: true
+initialization:
+  mode: fresh_init
+task:
+  name: hq_codec
+loss:
+  w_char: 1.0
+  w_ms_ssim: 0.0
+  w_grad: 0.0
+  w_flux: 0.0
+  w_hf: 0.0
+  free_nats: 0.0
+  ms_ssim_start_step: 100000
+  amp_norm: true
+  amp_norm_min_scale: 0.20
+  amp_low_structure_range: 0.08
+  amp_low_structure_scale: 1.0
+  amp_smooth: true
+  unstructured_bg_weight: 0.25
+  idle_loss_mult: 0.25
+  structure_support_kernel: 9
+  structure_support_floor: 0.02
+  structure_support_rel: 0.25
+  structure_support_min_density: 0.15
+  structure_min_frac: 0.0003
+  edge_weight: 0.75
+  edge_weight_clip: 3.0
+  perceptual:
+    enabled: true
+    weight: 0.05
+    start_step: 0
+    ramp_steps: 0
+    backbone: internal_conv
+    freeze: true
+    init_seed: 0
+  adversarial:
+    enabled: true
+    weight: 0.02
+    start_step: 0
+    ramp_steps: 0
+    conditioning: none
+    gan_loss: hinge
+    spectral_norm: true
+    ndf: 16
+    n_layers: 2
+  influence:
+    log_contrib_ratio: true
+    grad_every_steps: 0
+    cosine_every_steps: 0
+kl_schedule:
+  t0: 0
+  t1: 1
+  beta_max: 0.0001
+optimizer:
+  lr: 0.001
+training:
+  max_steps: 4
+  microbatch_size: 2
+  grad_accum: 1
+  log_every_steps: 1
+  val_every_steps: 2
+  overfit_n_patches: 4
+  num_workers: 0
+  ema_decay: 0.999
+scheduler:
+  warmup_steps: 0
+  min_lr: 0.000001
+precision:
+  amp_dtype: fp32
+memory:
+  gradient_checkpointing: false
+evaluation:
+  allow_test: false
+  max_bootstrap: 8
+checkpoint:
+  save_every_steps: 2
+  keep_last: 3

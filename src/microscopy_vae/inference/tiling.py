@@ -593,3 +593,100 @@ def pair_overlaps(origins: Sequence[int], tile_size: int) -> List[int]:
     for a, b in zip(origins, origins[1:]):
         ov.append(max(0, a + tile_size - b))
     return ov
+
+
+@torch.no_grad()
+def reconstruct_halo(
+    model,
+    x: torch.Tensor,
+    *,
+    tile_size: int,
+    overlap: int,
+    halo: int,
+    spatial_compression: int,
+    padding_mode: str = "reflect",
+    blend_mode: str = "linear",
+    return_aux: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, Any]]:
+    """Tiled recon whose *halo* is real image context, not reflect-padded interior.
+
+    For each core box, the forward window is ``x[hy0:hy1, hx0:hx1]`` clipped to
+    the real canvas. Only the core is written back. Encoder alignment pad (to a
+    multiple of ``spatial_compression``) may still reflect on that window's
+    border; it does not invent pixels from outside the real image interior.
+    """
+    if x.ndim != 4 or x.shape[1] != 1:
+        raise ValueError(f"expected [B,1,H,W], got {tuple(x.shape)}")
+    halo = max(int(halo), 0)
+    if halo <= 0:
+        return reconstruct_tiled(
+            model,
+            x,
+            tile_size=tile_size,
+            overlap=overlap,
+            spatial_compression=spatial_compression,
+            padding_mode=padding_mode,
+            blend_mode=blend_mode,
+            return_aux=return_aux,
+        )
+    if tile_size % spatial_compression != 0:
+        raise ValueError(
+            f"tile_size={tile_size} must be divisible by spatial_compression={spatial_compression}"
+        )
+    x_work, small_pad = pad_if_smaller(x, tile_size, mode=padding_mode)
+    h, w = x_work.shape[-2:]
+    boxes = tile_boxes(h, w, tile_size, overlap, snap=spatial_compression)
+    out = torch.zeros_like(x_work)
+    weight = torch.zeros((x_work.shape[0], 1, h, w), device=x_work.device, dtype=x_work.dtype)
+    tile_meta: List[Dict[str, int]] = []
+    for y0, x0, y1, x1 in boxes:
+        hy0 = max(0, y0 - halo)
+        hx0 = max(0, x0 - halo)
+        hy1 = min(h, y1 + halo)
+        hx1 = min(w, x1 + halo)
+        window = x_work[:, :, hy0:hy1, hx0:hx1]
+        recon_w = reconstruct_one_tile(
+            model, window, spatial_compression=spatial_compression, padding_mode=padding_mode
+        )
+        cy0 = y0 - hy0
+        cx0 = x0 - hx0
+        th, tw = y1 - y0, x1 - x0
+        core = recon_w[:, :, cy0 : cy0 + th, cx0 : cx0 + tw]
+        if core.shape[-2] != th or core.shape[-1] != tw:
+            raise RuntimeError(
+                f"halo core shape {tuple(core.shape[-2:])} != {(th, tw)} at {(y0, x0)}"
+            )
+        wgt = tile_blend_window(
+            y0, x0, th, tw, h, w, overlap, mode=blend_mode, device=x_work.device, dtype=x_work.dtype
+        ).view(1, 1, th, tw)
+        out[:, :, y0:y1, x0:x1] += core * wgt
+        weight[:, :, y0:y1, x0:x1] += wgt
+        tile_meta.append(
+            {
+                "y0": int(y0),
+                "x0": int(x0),
+                "halo_y0": int(hy0),
+                "halo_x0": int(hx0),
+                "halo_h": int(hy1 - hy0),
+                "halo_w": int(hx1 - hx0),
+            }
+        )
+    if float(weight.min()) <= 0:
+        raise RuntimeError("halo weight map has zeros; coverage is incomplete")
+    fused = out / weight
+    y_out = unpad(fused, small_pad)
+    if y_out.shape[-2:] != x.shape[-2:]:
+        raise RuntimeError(f"halo recon shape {tuple(y_out.shape)} != input {tuple(x.shape)}")
+    if not return_aux:
+        return y_out
+    aux = {
+        "mode": "halo",
+        "input_hw": [int(x.shape[-2]), int(x.shape[-1])],
+        "tile_size": int(tile_size),
+        "overlap": int(overlap),
+        "halo": int(halo),
+        "n_tiles": len(tile_meta),
+        "tiles": tile_meta,
+        "context": "real_image_crop",
+    }
+    return y_out, aux

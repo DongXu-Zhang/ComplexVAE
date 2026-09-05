@@ -55,18 +55,30 @@ def cmd_smoke_test(args: argparse.Namespace) -> int:
     cfg.training.max_steps = min(cfg.training.max_steps, 4)
     from microscopy_vae.engine.trainer import Trainer
 
-    trainer = Trainer(cfg)
-    info = trainer.dry_run()
-    print(json.dumps(info, indent=2, default=str))
-    if info.get("has_test_loader"):
-        raise SystemExit("FAIL: test loader must not exist")
-    if args.dry_run:
-        print("OK: dry-run only")
+    trainer = None
+    try:
+        trainer = Trainer(cfg)
+        info = trainer.dry_run()
+        if trainer.dist.is_main:
+            print(json.dumps(info, indent=2, default=str))
+        if info.get("has_test_loader"):
+            raise SystemExit("FAIL: test loader must not exist")
+        if args.dry_run:
+            if trainer.dist.is_main:
+                print("OK: dry-run only")
+            return 0
+        result = trainer.train(max_steps=2)
+        if trainer.dist.is_main:
+            print(json.dumps({k: result[k] for k in ("final_step", "final_loss", "checkpoint")}, indent=2))
+            print("OK: smoke-test")
         return 0
-    result = trainer.train(max_steps=2)
-    print(json.dumps({k: result[k] for k in ("final_step", "final_loss", "checkpoint")}, indent=2))
-    print("OK: smoke-test")
-    return 0
+    finally:
+        if trainer is not None:
+            trainer.close()
+        else:
+            from microscopy_vae.engine.distributed import cleanup_distributed
+
+            cleanup_distributed()
 
 
 def cmd_overfit_small(args: argparse.Namespace) -> int:
@@ -81,21 +93,30 @@ def cmd_overfit_small(args: argparse.Namespace) -> int:
 
 def cmd_train(args: argparse.Namespace) -> int:
     cfg = _cfg(args)
+    from microscopy_vae.engine.distributed import cleanup_distributed
     from microscopy_vae.engine.trainer import Trainer
 
-    trainer = Trainer(cfg)
-    if args.dry_run:
-        print(json.dumps(trainer.dry_run(), indent=2, default=str))
+    trainer = None
+    try:
+        trainer = Trainer(cfg)
+        if args.dry_run:
+            print(json.dumps(trainer.dry_run(), indent=2, default=str))
+            return 0
+        result = trainer.train()
+        if trainer.dist.is_main:
+            print(
+                json.dumps(
+                    {k: result[k] for k in ("final_step", "final_loss", "checkpoint", "candidate_hits")},
+                    indent=2,
+                    default=str,
+                )
+            )
         return 0
-    result = trainer.train()
-    print(
-        json.dumps(
-            {k: result[k] for k in ("final_step", "final_loss", "checkpoint", "candidate_hits")},
-            indent=2,
-            default=str,
-        )
-    )
-    return 0
+    finally:
+        if trainer is not None:
+            trainer.close()
+        else:
+            cleanup_distributed()
 
 
 def cmd_fit_normalizer(args: argparse.Namespace) -> int:
@@ -193,13 +214,25 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     cfg = _cfg(args)
     from microscopy_vae.engine.trainer import Trainer
     from microscopy_vae.engine.evaluator import evaluate_hq_loader
-    from microscopy_vae.engine.checkpoint import CheckpointManager
+    from microscopy_vae.inference.compare import load_infer_weights
 
-    # force short synthetic if needed
+    if str(cfg.normalization.scale_mode) == "per_source":
+        art = cfg.normalization.artifact_path
+        existing = Path(cfg.experiment.output_dir) / "normalizer.json"
+        if not ((art and Path(str(art)).is_file()) or existing.is_file()):
+            raise SystemExit(
+                "evaluate with per-source scale must reuse THAT run's normalizer.json "
+                "(normalization.artifact_path or experiment.output_dir/normalizer.json). "
+                "Refusing to refit a new scale just to print metrics."
+            )
     trainer = Trainer(cfg)
     weights = args.weights
     if weights:
-        CheckpointManager.load_exported_weights(Path(weights), trainer.system.vae)
+        load_infer_weights(
+            Path(weights),
+            trainer.system.vae,
+            use_ema=not bool(getattr(args, "raw_weights", False)),
+        )
     metrics = evaluate_hq_loader(
         trainer.system,
         trainer.val_loader,
@@ -216,6 +249,44 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bind_infer_normalizer(cfg, args, *, path_for_source=None, extra_source: Optional[str] = None):
+    """Load this run's normalizer. Per-source configs must not see raw intensities."""
+    from microscopy_vae.data.normalization import (
+        NormalizationState,
+        Normalizer,
+        assert_artifact_matches_config,
+        guess_source_from_path,
+    )
+
+    npath = getattr(args, "normalizer", None)
+    per_source = str(cfg.normalization.scale_mode) == "per_source"
+    if not npath:
+        if per_source:
+            raise SystemExit(
+                "per-source config requires --normalizer pointing at THIS run's "
+                "normalizer.json. Raw microscope units are not the training domain."
+            )
+        return None, extra_source
+    state = NormalizationState.load(Path(npath))
+    assert_artifact_matches_config(
+        state,
+        cfg.normalization,
+        allow_legacy=bool(getattr(cfg.normalization, "allow_legacy_artifact", False)),
+    )
+    norm = Normalizer(state)
+    source = (
+        getattr(args, "source", None)
+        or extra_source
+        or guess_source_from_path(path_for_source or getattr(args, "input", None), known=norm.known_sources())
+    )
+    if norm.is_per_source() and not source:
+        raise SystemExit(
+            "per-source normalizer: pass --source BioTISR|DeepInsight_2D|DeepInsight_3D "
+            "or use a path that contains one of those names"
+        )
+    return norm, source
+
+
 def _save_float_image(path: Path, arr) -> None:
     import io
 
@@ -225,7 +296,10 @@ def _save_float_image(path: Path, arr) -> None:
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.suffix.lower() in {".tif", ".tiff"}:
+    suf = path.suffix.lower()
+    if suf not in {".tif", ".tiff", ".npy", ".npz"}:
+        raise SystemExit(f"output suffix must be .npy/.tif/.tiff, got {path.suffix!r}")
+    if suf in {".tif", ".tiff"}:
         import os
         import tempfile
 
@@ -257,17 +331,17 @@ def cmd_infer(args: argparse.Namespace) -> int:
     )
     from microscopy_vae.inference.compare import load_infer_weights, run_full_tiled_compare, save_compare_pack
     from microscopy_vae.data.readers import read_page
-    from microscopy_vae.data.normalization import NormalizationState, Normalizer, guess_source_from_path
     import numpy as np
 
     if not args.input or not args.output:
         raise SystemExit("infer requires --input and --output")
+    norm, infer_source = _bind_infer_normalizer(cfg, args, path_for_source=args.input)
     mode = str(getattr(args, "inference_mode", None) or "full")
     # --tiled is a backward-compat alias only when mode was left at default full.
     if bool(getattr(args, "tiled", False)) and mode == "full":
         mode = "tiled"
-    if mode not in {"full", "tiled", "compare"}:
-        raise SystemExit("inference-mode must be full | tiled | compare")
+    if mode not in {"full", "tiled", "compare", "halo"}:
+        raise SystemExit("inference-mode must be full | tiled | compare | halo")
 
     from microscopy_vae.inference.devices import describe_devices, parse_devices, primary_device
     from microscopy_vae.inference.parallel import run_tiled
@@ -291,18 +365,7 @@ def cmd_infer(args: argparse.Namespace) -> int:
     if system.perceptual is not None:
         system.perceptual.eval()
     page, _ = read_page(Path(args.input), int(args.page))
-    norm = None
-    infer_source = None
-    if args.normalizer:
-        norm = Normalizer(NormalizationState.load(Path(args.normalizer)))
-        infer_source = getattr(args, "source", None) or guess_source_from_path(
-            args.input, known=norm.known_sources()
-        )
-        if norm.is_per_source() and not infer_source:
-            raise SystemExit(
-                "per-source normalizer: pass --source BioTISR|DeepInsight_2D|DeepInsight_3D "
-                "or use an input path that contains one of those names"
-            )
+    if norm is not None:
         x_np = norm.transform(page, source=infer_source)
     else:
         x_np = page.astype(np.float32)
@@ -315,7 +378,7 @@ def cmd_infer(args: argparse.Namespace) -> int:
     overlap = int(args.overlap)
     blend = str(getattr(args, "blend_mode", None) or "linear")
 
-    if mode in {"tiled", "compare"} and tile_size % f != 0:
+    if mode in {"tiled", "compare", "halo"} and tile_size % f != 0:
         raise SystemExit(
             f"--tile-size={tile_size} must be divisible by spatial_compression=f{f}"
         )
@@ -335,6 +398,8 @@ def cmd_infer(args: argparse.Namespace) -> int:
         "dtype": str(x.dtype),
         "normalizer": str(args.normalizer) if args.normalizer else None,
         "source": infer_source,
+        "scale_mode": str(cfg.normalization.scale_mode),
+        "clip": bool(cfg.normalization.clip),
         "attention_matrix_numel_full_padded": int(attn_n),
         "config_sha256": config_semantic_hash(cfg),
     }
@@ -373,11 +438,16 @@ def cmd_infer(args: argparse.Namespace) -> int:
                 cfg_dump=resolved_dict(cfg),
             )
             if norm is not None:
+                pack["metrics"]["metrics_domain"] = "normalized"
+                pack["metrics"]["saved_arrays_domain"] = "raw_inverse"
                 for k in ("full", "tiled", "target"):
                     pack[k] = norm.inverse(pack[k], source=infer_source)
                 pack["residual_full"] = pack["full"] - pack["target"]
                 pack["residual_tiled"] = pack["tiled"] - pack["target"]
                 pack["diff_full_tiled"] = pack["full"] - pack["tiled"]
+            else:
+                pack["metrics"]["metrics_domain"] = "network_input"
+                pack["metrics"]["saved_arrays_domain"] = "network_input"
             out_dir = Path(args.output)
             save_compare_pack(pack, out_dir)
             tiled_aux = (pack.get("metrics") or {}).get("tiled_aux") or {}
@@ -409,6 +479,27 @@ def cmd_infer(args: argparse.Namespace) -> int:
             info["forward_wall_s"] = float(time.perf_counter() - t0)
             info["tiled_aux"] = {k: v for k, v in aux.items() if k != "weight"}
             info["parallel"] = aux.get("parallel")
+        elif mode == "halo":
+            from microscopy_vae.inference.tiling import reconstruct_halo
+
+            halo = int(getattr(args, "halo", None) or 64)
+            _sync()
+            t0 = time.perf_counter()
+            y, aux = reconstruct_halo(
+                system.vae,
+                x,
+                tile_size=tile_size,
+                overlap=overlap,
+                halo=halo,
+                spatial_compression=f,
+                padding_mode=pad_mode,
+                blend_mode=blend,
+                return_aux=True,
+            )
+            _sync()
+            info["forward_wall_s"] = float(time.perf_counter() - t0)
+            info["halo_aux"] = aux
+            info["parallel"] = {"mode": "none", "reason": "halo uses real context on one device"}
         else:
             _sync()
             t0 = time.perf_counter()
@@ -422,6 +513,13 @@ def cmd_infer(args: argparse.Namespace) -> int:
     y_np = y.squeeze().detach().cpu().numpy().astype(np.float32)
     if norm is not None:
         y_np = norm.inverse(y_np, source=infer_source)
+        info["output_domain"] = "raw_inverse"
+        if infer_source and norm.is_per_source():
+            lo, hi = norm.scale_for(infer_source)
+            info["source_low"] = float(lo)
+            info["source_high"] = float(hi)
+    else:
+        info["output_domain"] = "network_input"
     out = Path(args.output)
     _save_float_image(out, y_np)
     info["output"] = str(out)
@@ -455,23 +553,16 @@ def cmd_encode(args: argparse.Namespace) -> int:
     """Write posterior mean (internal unscaled z) plus padding metadata. No SD 0.18215."""
     cfg = _cfg(args)
     from microscopy_vae.data.readers import read_page
-    from microscopy_vae.data.normalization import NormalizationState, Normalizer, guess_source_from_path
     from microscopy_vae.inference.tiling import encode_full
     from microscopy_vae.provenance.hashing import sha256_file
     import numpy as np
 
     if not args.input or not args.output:
         raise SystemExit("encode requires --input and --output")
+    norm, infer_source = _bind_infer_normalizer(cfg, args, path_for_source=args.input)
     system, primary, weights_kind = _load_infer_system(cfg, args)
     page, _ = read_page(Path(args.input), int(args.page))
-    infer_source = None
-    if args.normalizer:
-        norm = Normalizer(NormalizationState.load(Path(args.normalizer)))
-        infer_source = getattr(args, "source", None) or guess_source_from_path(
-            args.input, known=norm.known_sources()
-        )
-        if norm.is_per_source() and not infer_source:
-            raise SystemExit("per-source normalizer: pass --source or a path containing the source name")
+    if norm is not None:
         x_np = norm.transform(page, source=infer_source)
     else:
         x_np = page.astype(np.float32)
@@ -515,13 +606,13 @@ def cmd_encode(args: argparse.Namespace) -> int:
 
 def cmd_decode(args: argparse.Namespace) -> int:
     cfg = _cfg(args)
-    from microscopy_vae.data.normalization import NormalizationState, Normalizer, guess_source_from_path
     from microscopy_vae.inference.tiling import decode_full
     from microscopy_vae.provenance.hashing import sha256_file
     import numpy as np
 
     if not args.input or not args.output:
         raise SystemExit("decode requires --input and --output")
+    # Source may come from encode metadata; bind after meta load.
     system, primary, weights_kind = _load_infer_system(cfg, args)
     z_np = np.load(str(args.input))
     if z_np.ndim == 3:
@@ -531,6 +622,7 @@ def cmd_decode(args: argparse.Namespace) -> int:
     z = torch.from_numpy(np.ascontiguousarray(z_np.astype(np.float32))).to(primary)
     pad_hw = (0, 0)
     output_hw = None
+    meta: Dict[str, Any] = {}
     meta_path = getattr(args, "meta", None)
     if not meta_path:
         cand = Path(args.input).with_suffix(".json")
@@ -547,13 +639,11 @@ def cmd_decode(args: argparse.Namespace) -> int:
             )
     y = decode_full(system.vae, z, pad_hw=pad_hw, output_hw=output_hw)
     y_np = y.squeeze().detach().cpu().numpy().astype(np.float32)
-    infer_source = getattr(args, "source", None) or (
-        guess_source_from_path(args.output) if args.output else None
+    meta_source = meta.get("source") if isinstance(meta, dict) else None
+    norm, infer_source = _bind_infer_normalizer(
+        cfg, args, path_for_source=args.output or args.input, extra_source=meta_source
     )
-    if args.normalizer:
-        norm = Normalizer(NormalizationState.load(Path(args.normalizer)))
-        if norm.is_per_source() and not infer_source:
-            raise SystemExit("per-source normalizer: pass --source for decode inverse")
+    if norm is not None:
         y_np = norm.inverse(y_np, source=infer_source)
     out = Path(args.output)
     _save_float_image(out, y_np)
@@ -669,7 +759,7 @@ def _run_val_rows(cfg, weights: str, normalizer_path: Optional[str], unit_scale:
     import tempfile
 
     from microscopy_vae.engine.trainer import Trainer
-    from microscopy_vae.engine.val_report import collect_val_pages, default_unit_scale
+    from microscopy_vae.engine.val_report import collect_val_pages
     from microscopy_vae.inference.compare import load_infer_weights
 
     if not normalizer_path:
@@ -687,7 +777,8 @@ def _run_val_rows(cfg, weights: str, normalizer_path: Optional[str], unit_scale:
     if trainer.system.perceptual is not None:
         trainer.system.perceptual.eval()
     norm = trainer.normalizer
-    scale = float(unit_scale) if unit_scale is not None else default_unit_scale(norm.state)
+    # None → per-source (high-low) so Bio/DI2D are not crushed by DI3D's H.
+    scale = float(unit_scale) if unit_scale is not None else None
     loader = trainer.val_loader
     if max_batches is not None:
         from itertools import islice
@@ -733,14 +824,14 @@ def cmd_eval_val_report(args: argparse.Namespace) -> int:
         bool(args.raw_weights),
     )
     summary = summarize_rows(rows, cfg=cfg.evaluation)
-    summary["unit_scale"] = scale
+    summary["unit_scale"] = scale if scale is not None else "per_source_span"
     summary["transform_id"] = norm.state.transform_id
     summary["normalizer_contract"] = norm.state.contract_dict()
     dump_page_jsonl(out_dir / "metrics_val_pages.jsonl", rows)
     write_report(out_dir / "val_severe_report.json", summary)
     want = {w["sample_id"]: i for i, w in enumerate(summary["worst_tail"])}
     if want:
-        from microscopy_vae.engine.val_report import to_common_unit, to_raw_nonneg
+        from microscopy_vae.engine.val_report import source_unit_scale, to_common_unit, to_raw_nonneg
 
         cases = out_dir / "worst_cases"
         for batch in trainer.val_loader:
@@ -753,11 +844,16 @@ def cmd_eval_val_report(args: argparse.Namespace) -> int:
                 xi = batch.hq[i, 0].numpy()
                 ri = recon[0, 0].detach().float().cpu().numpy()
                 src = batch.sources[i]
+                scale_i = (
+                    float(scale)
+                    if scale is not None
+                    else source_unit_scale(trainer.normalizer.state, src)
+                )
                 tgt = to_common_unit(
-                    to_raw_nonneg(xi, trainer.normalizer, is_raw=False, source=src), scale
+                    to_raw_nonneg(xi, trainer.normalizer, is_raw=False, source=src), scale_i
                 )
                 pred = to_common_unit(
-                    to_raw_nonneg(ri, trainer.normalizer, is_raw=False, source=src), scale
+                    to_raw_nonneg(ri, trainer.normalizer, is_raw=False, source=src), scale_i
                 )
                 lo = float(np.quantile(tgt, 0.005))
                 hi = float(np.quantile(tgt, 0.995))
@@ -886,6 +982,11 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "evaluate":
             sp.add_argument("--weights", type=str, default=None)
             sp.add_argument("--full", action="store_true")
+            sp.add_argument(
+                "--raw-weights",
+                action="store_true",
+                help="do not copy EMA even if the checkpoint extra contains it",
+            )
         if name == "infer":
             sp.add_argument("--input", type=str, default=None)
             sp.add_argument("--output", type=str, default=None)
@@ -896,14 +997,20 @@ def build_parser() -> argparse.ArgumentParser:
                 "--inference-mode",
                 type=str,
                 default="full",
-                choices=["full", "tiled", "compare"],
-                help="full | tiled | compare (same image, same weights, same normalizer)",
+                choices=["full", "tiled", "compare", "halo"],
+                help="full | tiled | compare | halo (halo uses real-image context around each 256 core)",
             )
             sp.add_argument("--tiled", action="store_true", help="alias for --inference-mode tiled")
             sp.add_argument("--tile-size", type=int, default=256)
             sp.add_argument("--overlap", type=int, default=32)
             sp.add_argument("--blend-mode", type=str, default="linear", choices=["linear", "hann"])
             sp.add_argument("--padding-mode", type=str, default="reflect")
+            sp.add_argument(
+                "--halo",
+                type=int,
+                default=64,
+                help="extra real-image context (pixels) on each side for --inference-mode halo",
+            )
             sp.add_argument(
                 "--raw-weights",
                 action="store_true",
@@ -919,7 +1026,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "--source",
                 type=str,
                 default=None,
-                help="BioTISR | DeepInsight_2D | DeepInsight_3D (required for per-source V4 normalizer if path does not contain it)",
+                help="BioTISR | DeepInsight_2D | DeepInsight_3D (required for a per-source normalizer if the path does not contain it)",
             )
         if name in {"encode", "decode"}:
             sp.add_argument("--input", type=str, default=None)

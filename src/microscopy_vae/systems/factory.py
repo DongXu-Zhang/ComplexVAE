@@ -76,6 +76,8 @@ def build_hq_codec_system(cfg: RootConfig) -> HQCodecSystem:
         structure_support_rel=float(getattr(cfg.loss, "structure_support_rel", 0.25)),
         structure_support_min_density=float(getattr(cfg.loss, "structure_support_min_density", 0.15)),
         structure_min_frac=float(getattr(cfg.loss, "structure_min_frac", 0.0)),
+        unstructured_bg_weight=float(getattr(cfg.loss, "unstructured_bg_weight", 0.0)),
+        amp_smooth=bool(getattr(cfg.loss, "amp_smooth", False)),
         perceptual=perc_mod,
         perc_weight=float(pcfg.weight) if pcfg.enabled else 0.0,
         perc_start_step=int(pcfg.start_step),
