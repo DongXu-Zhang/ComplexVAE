@@ -10,6 +10,9 @@ from microscopy_vae.metrics.extended import (
     robust_foreground_mask,
     slice_metric_bundle,
     snr_db,
+    ssim_local,
+    ssim_mean,
+    target_robust_range,
     volume_pooled_psnr,
 )
 from microscopy_vae.metrics.focus import score_volume_slices, select_case_slice_index
@@ -41,6 +44,21 @@ def test_low_contrast_inflates_range1_psnr_but_not_nmse():
     assert psnr > 45.0
     assert nmse(pred, tgt) > 0.0
     assert np.isfinite(snr_db(pred, tgt))
+
+
+def test_constant_mean_has_nmse_one_and_local_ssim_below_range1():
+    rng = np.random.default_rng(4)
+    tgt = (0.02 * rng.random((64, 64))).astype(np.float32)
+    # Replace structure with a different texture of similar mean (Lifeact-like failure).
+    pred = (0.02 * rng.random((64, 64))).astype(np.float32)
+    pred = pred - pred.mean() + tgt.mean()
+    const = np.full_like(tgt, float(tgt.mean()))
+    assert nmse(const, tgt) == pytest.approx(1.0, rel=1e-5, abs=1e-5)
+    assert ssim_mean(pred, tgt, data_range=1.0) > ssim_local(pred, tgt)
+    assert target_robust_range(tgt) < 0.05
+    b = slice_metric_bundle(pred, tgt)
+    assert "ssim_local" in b and "nmse" in b
+    assert b["ssim_range1"] > b["ssim_local"]
 
 
 def test_foreground_mask_bright_spot():

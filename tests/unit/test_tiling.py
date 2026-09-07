@@ -7,6 +7,7 @@ from microscopy_vae.inference.tiling import (
     pad_to_multiple,
     pair_overlaps,
     reconstruct_full,
+    reconstruct_halo,
     reconstruct_tiled,
     tile_boxes,
     unpad,
@@ -150,6 +151,25 @@ def test_posterior_mean_is_deterministic():
     a = reconstruct_full(model, x, spatial_compression=4)
     b = reconstruct_full(model, x, spatial_compression=4)
     assert torch.equal(a, b)
+
+
+def test_halo_keeps_shape_and_uses_real_window():
+    model = _tiny(attn=False)
+    x = torch.randn(1, 1, 96, 96)
+    y, aux = reconstruct_halo(
+        model,
+        x,
+        tile_size=64,
+        overlap=16,
+        halo=16,
+        spatial_compression=4,
+        return_aux=True,
+    )
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+    assert aux["mode"] == "halo"
+    assert int(aux["halo"]) == 16
+    assert int(aux["n_tiles"]) >= 1
 
 
 def test_reflect_pad_larger_than_image():

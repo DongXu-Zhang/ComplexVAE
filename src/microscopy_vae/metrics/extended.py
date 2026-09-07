@@ -85,6 +85,21 @@ def ssim_mean(pred: np.ndarray, target: np.ndarray, data_range: float = 1.0) -> 
     return float(ssim_map_torch(pt, tt, data_range=data_range).mean().item())
 
 
+def target_robust_range(target: np.ndarray) -> float:
+    """p99.5-p0.5 of Target. Same robust window as training amp_norm, eval-only."""
+    t = np.asarray(target, dtype=np.float64).reshape(-1)
+    if t.size == 0:
+        return 0.0
+    lo, hi = np.quantile(t, [0.005, 0.995])
+    return float(max(hi - lo, 0.0))
+
+
+def ssim_local(pred: np.ndarray, target: np.ndarray, *, min_range: float = 1e-6) -> float:
+    """SSIM with data_range = Target p99.5-p0.5. Catches low-amplitude structure loss."""
+    rng = max(target_robust_range(target), float(min_range))
+    return ssim_mean(pred, target, data_range=rng)
+
+
 def robust_foreground_mask(
     image: np.ndarray,
     *,
@@ -194,6 +209,8 @@ def slice_metric_bundle(
         "nmse": nmse(pred, target),
         "snr_db": snr_db(pred, target),
         "ssim_range1": ssim_mean(pred, target, data_range=1.0),
+        "ssim_local": ssim_local(pred, target),
+        "target_robust_range": target_robust_range(target),
         "signed_bias": float(pred.astype(np.float64).mean() - target.astype(np.float64).mean()),
         "target_std": float(target.astype(np.float64).std()),
         "target_p01": float(np.quantile(target.astype(np.float64), 0.01)),

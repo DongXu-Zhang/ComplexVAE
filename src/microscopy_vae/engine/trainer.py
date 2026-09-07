@@ -538,12 +538,22 @@ class Trainer:
         cfg = self.cfg
         if not bool(getattr(cfg.normalization, "calibrate_thresholds", False)):
             return
+        saved_ver = str(getattr(state, "threshold_version", "") or "")
+        stale_thresholds = bool(state.per_source_thresholds) and saved_ver != THRESHOLD_VERSION
+        if stale_thresholds:
+            self.logger.info(
+                "refitting structure thresholds (%s -> %s); do not reuse a v1 "
+                "normalizer.json whose support floor was intensity-bg and yaml-capped at 0.02",
+                saved_ver or "missing",
+                THRESHOLD_VERSION,
+            )
+            state.per_source_thresholds = {}
         if not state.per_source_thresholds:
             if not train_imgs or not self._norm_sources:
                 raise RuntimeError(
                     "calibrate_thresholds=true but this run has no train images to fit "
-                    "and normalizer.json has no per_source_thresholds. "
-                    "Do not load a V4 artifact into a V5 config."
+                    "and normalizer.json has no current per_source_thresholds. "
+                    "Do not load a V4 artifact or a v1-threshold V5 normalizer.json."
                 )
             normed = [
                 self.normalizer.transform(im, source=s)
@@ -568,6 +578,7 @@ class Trainer:
                 struct_range_q=float(cfg.normalization.threshold_struct_range_q),
                 crops_per_page=int(cfg.normalization.threshold_crops_per_page),
                 seed=int(cfg.experiment.seed),
+                floor_min=float(getattr(cfg.loss, "structure_support_floor_min", 5e-4)),
             )
             state.per_source_thresholds = thr
             state.threshold_version = THRESHOLD_VERSION
@@ -1131,11 +1142,15 @@ class Trainer:
         }
         append_jsonl(self.run_dir / "metrics_val.jsonl", rec)
         self.logger.info(
-            "val step=%s weights=%s group_macro_psnr=%.4f mae=%.6f snr=%.4f pooled=%.4f by_source=%s",
+            "val step=%s weights=%s psnr=%.4f mae=%.6f nmse=%.4f ssim_local=%.4f "
+            "ssim_range1=%.4f snr=%.4f pooled=%.4f by_source_psnr=%s",
             self.state.optimizer_step,
             rec["weights"],
             metrics["group_macro"].get("psnr", float("nan")),
             metrics["group_macro"].get("mae", float("nan")),
+            metrics["group_macro"].get("nmse", float("nan")),
+            metrics["group_macro"].get("ssim_local", float("nan")),
+            metrics["group_macro"].get("ssim_range1", float("nan")),
             metrics["group_macro"].get("snr_db", float("nan")),
             metrics["group_macro"].get("psnr_mse_pooled", float("nan")),
             {k: v.get("psnr") for k, v in (metrics.get("by_source") or {}).items()},

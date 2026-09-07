@@ -262,8 +262,9 @@ def test_fit_thresholds_are_source_specific_and_at_most_yaml_floor():
     )
     assert decoupled["A"]["amp_low_structure_range"] == pytest.approx(0.08)
     assert decoupled["A"]["crop_min_robust_range"] <= 0.03 + 1e-12
-    assert thr["A"]["structure_support_floor"] >= 0.002 - 1e-12
+    assert thr["A"]["structure_support_floor"] >= 5e-4 - 1e-12
     assert diag["A"]["n_crops"] > 0
+    assert diag["A"]["floor_rule"] == "low_gradient_quiet_pixels"
 
 
 def test_rejected_empty_crop_does_not_consume_coverage_cell():
@@ -511,6 +512,7 @@ def test_ablation_yamls_load():
     scharr = load_config(_repo() / "configs/experiment/s1_hq_f8z4_v5_scharr.yaml")
     hf = load_config(_repo() / "configs/experiment/s1_hq_f8z4_v5_hf.yaml")
     rec = load_config(_repo() / "configs/experiment/s1_hq_f8z4_v5.yaml")
+    v6 = load_config(_repo() / "configs/experiment/s1_hq_f8z4_v6.yaml")
     assert clip.normalization.clip is True
     assert rec.normalization.clip is False
     assert nogan.loss.adversarial.enabled is False
@@ -520,13 +522,90 @@ def test_ablation_yamls_load():
     assert rec.crop.empty_keep_prob == 0.55
     assert rec.loss.amp_smooth is True
     assert rec.loss.unstructured_bg_weight == 0.25
+    assert v6.loss.adversarial.enabled is False
+    assert v6.experiment.name == "s1_hq_f8z4_v6"
+    assert v6.experiment.output_dir != rec.experiment.output_dir
+    assert v6.inference.prefer_halo_over_isolated_tiles is True
+    assert v6.inference.halo == 64
+    assert v6.loss.structure_support_floor_min == pytest.approx(5e-4)
     # Single-factor ablations must keep the rest of the V5 protocol.
-    for cfg in (clip, nogan, scharr, hf):
+    for cfg in (clip, nogan, scharr, hf, v6):
         assert cfg.loss.amp_smooth is True
         assert cfg.loss.unstructured_bg_weight == 0.25
         assert cfg.crop.empty_keep_prob == 0.55
         assert cfg.normalization.calibrate_thresholds is True
         assert cfg.normalization.scale_mode == "per_source"
+
+
+def _dim_filament_mesh(n: int = 64, amp: float = 0.055, n_lines: int = 10, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:n, 0:n]
+    img = np.zeros((n, n), dtype=np.float32)
+    for _ in range(n_lines):
+        ang = rng.uniform(0, np.pi)
+        c, s = np.cos(ang), np.sin(ang)
+        off = rng.uniform(-n * 0.4, n * 0.4)
+        dist = (xx - n / 2) * s - (yy - n / 2) * c - off
+        img += np.exp(-0.5 * (dist / 1.1) ** 2)
+    img = img / (img.max() + 1e-8) * amp
+    return img
+
+
+def test_dim_filament_mesh_floor_not_locked_to_yaml_cap():
+    """Lifeact-like dim mesh must not snap support floor to 0.02."""
+    pages = [_dim_filament_mesh(64, 0.055, 10, seed=i) for i in range(8)]
+    sources = ["BioTISR"] * 8
+    thr, diag = fit_structure_thresholds(
+        pages,
+        sources,
+        crop_size=32,
+        fallback_floor=0.02,
+        fallback_range=0.08,
+        crops_per_page=2,
+        seed=0,
+        floor_min=5e-4,
+    )
+    floor = float(thr["BioTISR"]["structure_support_floor"])
+    assert floor < 0.02 - 1e-6
+    assert floor >= 5e-4 - 1e-12
+    t = torch.from_numpy(pages[0][None, None])
+    m02 = structure_support_mask(t, kernel=9, floor=0.02, rel=0.25, min_density=0.15)
+    mfit = structure_support_mask(t, kernel=9, floor=floor, rel=0.25, min_density=0.15)
+    assert float(mfit.mean()) > float(m02.mean())
+    assert float(mfit.mean()) > 0.01
+    assert diag["BioTISR"]["floor_rule"] == "low_gradient_quiet_pixels"
+
+
+def test_resolve_production_infer_prefers_halo_on_large_page():
+    from microscopy_vae.inference.policy import resolve_production_infer_mode
+
+    mode, note = resolve_production_infer_mode(
+        requested="tiled",
+        height=1536,
+        width=1536,
+        tile_size=256,
+        allow_isolated_tiles=False,
+        prefer_halo_over_isolated_tiles=True,
+    )
+    assert mode == "halo"
+    assert note is not None and "halo" in note
+    kept, _ = resolve_production_infer_mode(
+        requested="tiled",
+        height=1536,
+        width=1536,
+        tile_size=256,
+        allow_isolated_tiles=True,
+        prefer_halo_over_isolated_tiles=True,
+    )
+    assert kept == "tiled"
+    full, _ = resolve_production_infer_mode(
+        requested="full",
+        height=1536,
+        width=1536,
+        tile_size=256,
+        allow_isolated_tiles=False,
+    )
+    assert full == "full"
 
 
 def test_zero_input_bias_not_amplified_when_calibrated_amp_gate_on():

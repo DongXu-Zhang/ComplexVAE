@@ -23,7 +23,9 @@ from microscopy_vae.metrics.extended import (
     nmse,
     psnr_from_mse,
     robust_foreground_mask,
+    ssim_local,
     ssim_mean,
+    target_robust_range,
 )
 
 
@@ -35,6 +37,8 @@ def _finite_stats(pred: np.ndarray, target: np.ndarray) -> Dict[str, float]:
         "psnr_range1": psnr_from_mse(mse, 1.0),
         "nmse": nmse(pred, target),
         "ssim_range1": ssim_mean(pred, target, data_range=1.0),
+        "ssim_local": ssim_local(pred, target),
+        "target_robust_range": target_robust_range(target),
         "signed_bias": float(pred.astype(np.float64).mean() - target.astype(np.float64).mean()),
     }
 

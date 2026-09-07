@@ -65,6 +65,8 @@ def test_support_rejects_isolated_spike_on_black_and_grey():
         t[0, 0, 32, 32] = bg + 0.4
         m = _mask(t)
         assert float(m[0, 0, 30:35, 30:35].max()) < 0.5, f"spike on bg={bg} should not be structure"
+        m_lo = structure_support_mask(t, kernel=9, floor=0.002, rel=0.25, min_density=0.15)
+        assert float(m_lo[0, 0, 30:35, 30:35].max()) < 0.5, f"spike on bg={bg} must fail density at low floor"
 
 
 def test_support_keeps_filament_on_grey():
@@ -72,6 +74,14 @@ def test_support_keeps_filament_on_grey():
     m = _mask(t)
     assert float(m[0, 0, 16:48, 30:35].max()) > 0.5
     assert float(m.mean()) > 0.01
+
+
+def test_support_keeps_dim_filament_when_floor_not_locked():
+    t = _filament_target(bg=0.0, height=0.05, n=64)
+    locked = structure_support_mask(t, kernel=9, floor=0.02, rel=0.25, min_density=0.15)
+    open_m = structure_support_mask(t, kernel=9, floor=0.002, rel=0.25, min_density=0.15)
+    assert float(open_m[0, 0, 16:48, 30:35].max()) > 0.5
+    assert float(open_m.mean()) > float(locked.mean())
 
 
 def test_edge_weight_does_not_boost_unsupported_spike():

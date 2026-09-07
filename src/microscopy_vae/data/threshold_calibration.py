@@ -13,7 +13,12 @@ import torch
 from microscopy_vae.losses.pixel import per_sample_robust_range, structure_support_mask
 from microscopy_vae.losses.structure import scharr_magnitude
 
-THRESHOLD_VERSION = "microvae-thresholds-v1"
+# v2: noise floor from low-gradient pixels, not low-intensity pixels.
+# v1 used intensity-dark pixels as "background"; a dense dim filament mesh
+# still has gradient there, so BioTISR/DeepInsight_2D floors snapped to the
+# yaml cap 0.02 and dropped real filaments from support.
+THRESHOLD_VERSION = "microvae-thresholds-v2"
+THRESHOLD_VERSION_V1 = "microvae-thresholds-v1"
 
 
 def _page_crops(page: np.ndarray, crop_size: int, n: int, rng: np.random.Generator) -> List[np.ndarray]:
@@ -54,14 +59,33 @@ def _crop_stats(
     mag = scharr_magnitude(t)
     support = structure_support_mask(t, kernel=kernel, floor=floor, rel=rel, min_density=min_density)
     frac = float(support.mean())
+    mag_flat = mag.reshape(-1)
+    scharr_mean = float(mag_flat.mean())
+    q = min(max(float(bg_quantile), 0.01), 0.49)
+    # Quiet = lowest-gradient pixels (camera noise / empty), not darkest intensity.
+    # Intensity-dark filaments still have Scharr energy and must not set the floor.
+    quiet_tau = float(torch.quantile(mag_flat, q))
+    quiet = mag_flat[mag_flat <= quiet_tau]
+    if quiet.numel() > 8:
+        quiet_p90 = float(torch.quantile(quiet, 0.90))
+        quiet_mean = float(quiet.mean())
+    elif quiet.numel() > 0:
+        quiet_p90 = float(quiet.max())
+        quiet_mean = float(quiet.mean())
+    else:
+        quiet_p90 = 0.0
+        quiet_mean = 0.0
     flat = t.reshape(-1)
-    bg_q = float(torch.quantile(flat, float(bg_quantile)))
-    bg = mag.reshape(-1)[flat <= bg_q]
+    bg_q = float(torch.quantile(flat, q))
+    bg = mag_flat[flat <= bg_q]
     bg_mag = float(bg.mean()) if bg.numel() else 0.0
     bg_p90 = float(torch.quantile(bg, 0.90)) if bg.numel() > 8 else bg_mag
     return {
         "robust_range": rng,
         "support_frac": frac,
+        "scharr_mean": scharr_mean,
+        "quiet_scharr_mean": quiet_mean,
+        "quiet_scharr_p90": quiet_p90,
         "bg_scharr_mean": bg_mag,
         "bg_scharr_p90": bg_p90,
         "mean": float(t.mean()),
@@ -86,8 +110,14 @@ def fit_structure_thresholds(
     crops_per_page: int = 4,
     seed: int = 0,
     fallback_amp_range: Optional[float] = None,
+    floor_min: float = 5e-4,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Any]]:
-    """Return (per_source_thresholds, diagnostics). Train images must already be normalized."""
+    """Return (per_source_thresholds, diagnostics). Train images must already be normalized.
+
+    ``structure_support_floor`` is a per-source noise floor for
+    ``max(rel * mean(Scharr), floor)``. yaml ``fallback_floor`` is an upper
+    cap and a no-crop fallback, not a magnet that snaps every source to 0.02.
+    """
     if len(norm_images) != len(sources):
         raise ValueError("norm_images/sources length mismatch")
     rng = np.random.default_rng(int(seed))
@@ -125,11 +155,22 @@ def fit_structure_thresholds(
             }
             diag[src] = {"n_crops": 0, "note": "no crops; yaml fallback"}
             continue
+        quiet_p90s = np.array([s["quiet_scharr_p90"] for s in stats], dtype=np.float64)
         bg_p90s = np.array([s["bg_scharr_p90"] for s in stats], dtype=np.float64)
-        floor_s = float(np.percentile(bg_p90s, float(bg_scharr_q)))
-        # Lower than V3's 0.02 so dim filaments count, but not to 1e-5
-        # (camera noise would then pass as "structure" and get edge/GAN).
-        floor_lo = min(2e-3, float(fallback_floor))
+        floor_s = float(np.percentile(quiet_p90s, float(bg_scharr_q)))
+        struct_mags = np.array(
+            [s["scharr_mean"] for s in stats if s["support_frac"] >= float(structure_min_frac)],
+            dtype=np.float64,
+        )
+        # Keep the additive floor below typical structure so dim meshes
+        # (Lifeact / TOMM20) are not gated by max(rel*mean, 0.02).
+        if struct_mags.size >= 4:
+            cap_by_struct = float(np.percentile(struct_mags, 10.0)) * 0.5
+            if cap_by_struct > 0.0:
+                floor_s = min(floor_s, cap_by_struct)
+        # yaml 0.02 is a ceiling, not the fitted value. Lower bound rejects
+        # 1e-5 camera noise without locking BioTISR to 0.02.
+        floor_lo = min(float(floor_min), float(fallback_floor))
         floor_s = float(np.clip(floor_s, floor_lo, float(fallback_floor)))
 
         empty_rr = np.array(
@@ -175,7 +216,11 @@ def fit_structure_thresholds(
             "support_frac_mean": float(np.mean([s["support_frac"] for s in stats])),
             "robust_range_p10": float(np.percentile([s["robust_range"] for s in stats], 10)),
             "robust_range_p50": float(np.percentile([s["robust_range"] for s in stats], 50)),
+            "quiet_scharr_p90_mean": float(quiet_p90s.mean()),
             "bg_scharr_p90_mean": float(bg_p90s.mean()),
+            "scharr_mean_p10": float(np.percentile([s["scharr_mean"] for s in stats], 10)),
+            "floor_min": float(floor_lo),
+            "floor_rule": "low_gradient_quiet_pixels",
             "fallback_floor": float(fallback_floor),
             "fallback_range": float(fallback_range),
         }

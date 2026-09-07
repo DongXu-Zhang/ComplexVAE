@@ -336,9 +336,9 @@ def cmd_infer(args: argparse.Namespace) -> int:
     if not args.input or not args.output:
         raise SystemExit("infer requires --input and --output")
     norm, infer_source = _bind_infer_normalizer(cfg, args, path_for_source=args.input)
-    mode = str(getattr(args, "inference_mode", None) or "full")
+    mode = str(getattr(args, "inference_mode", None) or getattr(cfg.inference, "default_mode", "full"))
     # --tiled is a backward-compat alias only when mode was left at default full.
-    if bool(getattr(args, "tiled", False)) and mode == "full":
+    if bool(getattr(args, "tiled", False)) and mode == str(getattr(cfg.inference, "default_mode", "full")):
         mode = "tiled"
     if mode not in {"full", "tiled", "compare", "halo"}:
         raise SystemExit("inference-mode must be full | tiled | compare | halo")
@@ -383,6 +383,20 @@ def cmd_infer(args: argparse.Namespace) -> int:
             f"--tile-size={tile_size} must be divisible by spatial_compression=f{f}"
         )
     h, w = int(x.shape[-2]), int(x.shape[-1])
+    from microscopy_vae.inference.policy import resolve_production_infer_mode
+
+    mode, mode_note = resolve_production_infer_mode(
+        requested=mode,
+        height=h,
+        width=w,
+        tile_size=tile_size,
+        allow_isolated_tiles=bool(getattr(args, "allow_isolated_tiles", False)),
+        prefer_halo_over_isolated_tiles=bool(
+            getattr(cfg.inference, "prefer_halo_over_isolated_tiles", True)
+        ),
+    )
+    if mode_note:
+        print(mode_note, file=sys.stderr)
     attn_n = attention_matrix_numel(h if h % f == 0 else h + (f - h % f) % f, w if w % f == 0 else w + (f - w % f) % f, f)
     info: Dict[str, Any] = {
         "mode": mode,
@@ -402,6 +416,7 @@ def cmd_infer(args: argparse.Namespace) -> int:
         "clip": bool(cfg.normalization.clip),
         "attention_matrix_numel_full_padded": int(attn_n),
         "config_sha256": config_semantic_hash(cfg),
+        "infer_mode_note": mode_note,
     }
     if args.weights:
         info["weights_sha256"] = sha256_file(Path(args.weights))
@@ -482,7 +497,7 @@ def cmd_infer(args: argparse.Namespace) -> int:
         elif mode == "halo":
             from microscopy_vae.inference.tiling import reconstruct_halo
 
-            halo = int(getattr(args, "halo", None) or 64)
+            halo = int(getattr(args, "halo", None) or getattr(cfg.inference, "halo", 64) or 64)
             _sync()
             t0 = time.perf_counter()
             y, aux = reconstruct_halo(
@@ -1009,7 +1024,12 @@ def build_parser() -> argparse.ArgumentParser:
                 "--halo",
                 type=int,
                 default=64,
-                help="extra real-image context (pixels) on each side for --inference-mode halo",
+                help="extra real-image context (pixels) on each side for halo inference",
+            )
+            sp.add_argument(
+                "--allow-isolated-tiles",
+                action="store_true",
+                help="keep isolated 256 tiles on large images (old tiled path; GroupNorm/attention lack real neighbors)",
             )
             sp.add_argument(
                 "--raw-weights",

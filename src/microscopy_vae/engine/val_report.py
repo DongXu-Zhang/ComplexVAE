@@ -20,7 +20,9 @@ from microscopy_vae.metrics.extended import (
     mse_np,
     nmse,
     psnr_from_mse,
+    ssim_local,
     ssim_mean,
+    target_robust_range,
 )
 from microscopy_vae.utils.atomic import atomic_write_text
 
@@ -99,6 +101,8 @@ def pair_eval_metrics(
         "psnr": psnr_from_mse(mse, data_range),
         "nmse": nmse(pred_unit, tgt_unit),
         "ssim": ssim_mean(pred_unit, tgt_unit, data_range=data_range),
+        "ssim_local": ssim_local(pred_unit, tgt_unit),
+        "target_robust_range": target_robust_range(tgt_unit),
         "signed_bias": float(pred_unit.astype(np.float64).mean() - tgt_unit.astype(np.float64).mean()),
         "pred_gt1_frac": highlight_overshoot_frac(pred_unit, hi=1.0),
     }

@@ -15,7 +15,13 @@ from microscopy_vae.metrics.aggregation import (
     page_to_group_macro,
     volume_mse_pooled_psnr,
 )
-from microscopy_vae.metrics.extended import background_false_positive_stats, nmse, ssim_mean
+from microscopy_vae.metrics.extended import (
+    background_false_positive_stats,
+    nmse,
+    ssim_local,
+    ssim_mean,
+    target_robust_range,
+)
 from microscopy_vae.metrics.fidelity import mae, mse, psnr, signed_mean_bias
 from microscopy_vae.systems.hq_codec import HQCodecSystem
 
@@ -66,9 +72,11 @@ def evaluate_hq_loader(
                     0.5
                     * (post.mean[i].pow(2) + post.var[i] - 1.0 - post.logvar[i]).mean().cpu()
                 ),
+                "nmse": float(nmse(ri_np, xi_np)),
+                "ssim_local": float(ssim_local(ri_np, xi_np)),
+                "target_robust_range": float(target_robust_range(xi_np)),
             }
             if extended_metrics:
-                m["nmse"] = float(nmse(ri_np, xi_np))
                 snr = -10.0 * np.log10(m["nmse"]) if m["nmse"] > 0 and np.isfinite(m["nmse"]) else float("nan")
                 m["snr_db"] = float(snr)
                 m["ssim_range1"] = float(ssim_mean(ri_np, xi_np, data_range=1.0))
@@ -80,6 +88,7 @@ def evaluate_hq_loader(
             sources.append(batch.sources[i])
             if report_constant_baseline:
                 c = torch.full_like(xi, float(xi.mean().cpu()))
+                c_np = np.full(xi_np.shape, float(xi.mean().cpu()), dtype=np.float32)
                 const_page.append(
                     {
                         "mae": float(mae(c, xi).cpu()),
@@ -88,12 +97,25 @@ def evaluate_hq_loader(
                         "signed_bias": float(signed_mean_bias(c, xi).cpu()),
                         "abs_bias": 0.0,
                         "kl_mean": 0.0,
+                        "nmse": float(nmse(c_np, xi_np)),
+                        "ssim_local": float(ssim_local(c_np, xi_np)),
+                        "target_robust_range": float(target_robust_range(xi_np)),
                     }
                 )
 
-    keys = ["mae", "mse", "psnr", "signed_bias", "abs_bias", "kl_mean"]
+    keys = [
+        "mae",
+        "mse",
+        "psnr",
+        "signed_bias",
+        "abs_bias",
+        "kl_mean",
+        "nmse",
+        "ssim_local",
+        "target_robust_range",
+    ]
     if extended_metrics:
-        keys.extend(["nmse", "snr_db", "ssim_range1", "target_std", "bg_fp_rate", "bg_bias", "bg_mae"])
+        keys.extend(["snr_db", "ssim_range1", "target_std", "bg_fp_rate", "bg_bias", "bg_mae"])
     macro = page_to_group_macro(page_metrics, group_ids, keys)
     macro["psnr_mse_pooled"] = volume_mse_pooled_psnr(
         [m["mse"] for m in page_metrics], group_ids, data_range=1.0

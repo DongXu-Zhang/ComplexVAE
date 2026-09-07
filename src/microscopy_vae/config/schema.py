@@ -276,7 +276,10 @@ class LossConfig(BaseModel):
     # Pixel-level structure support. 0/1 = off. Isolated spikes (any intensity)
     # fail the local density test; filaments/puncta pass. Not a color loss.
     structure_support_kernel: int = 0
+    # yaml floor is the no-crop fallback and the *upper cap* on the calibrated
+    # noise floor. It must not snap every source to 0.02.
     structure_support_floor: float = 0.02
+    structure_support_floor_min: float = 5e-4
     structure_support_rel: float = 0.25
     structure_support_min_density: float = 0.15
     # Additional idle if supported pixel fraction is below this. 0 = off.
@@ -342,6 +345,18 @@ class TrainingConfig(BaseModel):
     ddp_scale_global_batch: bool = False
     # Optional LR multiply by world_size. Requires ddp_scale_global_batch.
     ddp_scale_lr: bool = False
+
+
+class InferenceConfig(BaseModel):
+    """Production reconstruction of native pages. Training val stays 256 crops."""
+
+    model_config = ConfigDict(extra="forbid")
+    default_mode: Literal["full", "tiled", "halo", "compare"] = "full"
+    tile_size: int = 256
+    overlap: int = 32
+    halo: int = 64
+    # Isolated 256 tiles change GroupNorm/attention stats vs the native FOV.
+    prefer_halo_over_isolated_tiles: bool = True
 
 
 class EvaluationConfig(BaseModel):
@@ -424,6 +439,7 @@ class RootConfig(BaseModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
+    inference: InferenceConfig = Field(default_factory=InferenceConfig)
     bootstrap: BootstrapConfig = Field(default_factory=BootstrapConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     reproducibility: ReproConfig = Field(default_factory=ReproConfig)
