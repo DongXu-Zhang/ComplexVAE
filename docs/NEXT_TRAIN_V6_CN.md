@@ -1,5 +1,7 @@
 # 下一版训练（V6）：关 GAN + 新 support 门控 + 推理用真邻域
 
+**0.3.4 起官方下一训是 V8**（`configs/experiment/s1_hq_f8z4_v8.yaml`，`y = x/high_s`，不开 floor）。V6 是冻结对照，不要覆盖它的 run。
+
 在本机完成。不要复用 V5 111k 的 `normalizer.json`。不要覆盖 `runs/s1_hq_f8z4_v5`。
 
 ## 用哪个配置

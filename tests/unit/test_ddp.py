@@ -30,10 +30,10 @@ def test_resolve_per_device_batch_keeps_global_8():
     ) == (4, 2, 8)
     assert resolve_per_device_batch(
         yaml_microbatch=4, yaml_accum=2, world_size=2, scale_global_batch=False
-    ) == (2, 2, 8)
+    ) == (4, 1, 8)
     assert resolve_per_device_batch(
         yaml_microbatch=4, yaml_accum=2, world_size=4, scale_global_batch=False
-    ) == (1, 2, 8)
+    ) == (2, 1, 8)
     assert resolve_per_device_batch(
         yaml_microbatch=4, yaml_accum=2, world_size=8, scale_global_batch=False
     ) == (1, 1, 8)
@@ -44,6 +44,37 @@ def test_resolve_per_device_batch_keeps_global_8():
     assert resolve_per_device_batch(
         yaml_microbatch=4, yaml_accum=2, world_size=2, scale_global_batch=True
     ) == (4, 2, 16)
+
+
+def test_ema_resync_from_overwrites_divergent_shadow():
+    from microscopy_vae.engine.ema import EMA
+
+    m = torch.nn.Linear(4, 4, bias=False)
+    with torch.no_grad():
+        m.weight.fill_(1.0)
+    ema = EMA(m, decay=0.9)
+    with torch.no_grad():
+        m.weight.fill_(3.0)
+    assert float(ema.shadow["weight"].mean()) == pytest.approx(1.0)
+    ema.resync_from(m)
+    assert float(ema.shadow["weight"].mean()) == pytest.approx(3.0)
+    ema.update(m)
+    assert float(ema.shadow["weight"].mean()) == pytest.approx(3.0)
+
+
+def test_trainer_rank_seed_is_after_ddp_wrap():
+    import inspect
+
+    from microscopy_vae.engine.trainer import Trainer
+
+    src = inspect.getsource(Trainer.__init__)
+    build_at = src.find("build_hq_codec_system")
+    wrap_at = src.find("self._wrap_ddp()")
+    seed_at = src.find("derive_seed")
+    resync_at = src.find("ema.resync_from")
+    assert build_at != -1 and wrap_at != -1 and seed_at != -1 and resync_at != -1
+    assert build_at < wrap_at < seed_at
+    assert wrap_at < resync_at < seed_at
 
 
 def test_ddp_scale_lr_requires_scale_global_batch():
@@ -70,6 +101,58 @@ def test_ddp_timeout_env_default_is_six_hours():
     src = inspect.getsource(dmod.init_distributed)
     assert 'MICROVAE_DDP_TIMEOUT_MIN' in src
     assert '"360"' in src
+
+
+def _failflag_worker(rank: int, world: int, port: int, tmp: str, fail_rank: int) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    from microscopy_vae.engine.distributed import cleanup_distributed, init_distributed, raise_if_any_rank_failed
+
+    info = init_distributed()
+    caught = ""
+    try:
+        raise_if_any_rank_failed(rank != fail_rank, f"boom-rank{rank}", info)
+        status = "ok"
+    except RuntimeError as exc:
+        status = "fail"
+        caught = str(exc)
+    Path(tmp).joinpath(f"rank{rank}.txt").write_text(f"{status}|{caught}\n", encoding="utf-8")
+    cleanup_distributed(info)
+
+
+def test_raise_if_any_rank_failed_two_proc_gloo(tmp_path):
+    import time
+    import torch.multiprocessing as mp
+
+    def _run(fail_rank: int, tag: str):
+        port = 29611 + int(os.getpid() % 500) + fail_rank
+        d = tmp_path / tag
+        d.mkdir()
+        ctx = mp.get_context("spawn")
+        procs = [
+            ctx.Process(target=_failflag_worker, args=(r, 2, port, str(d), fail_rank))
+            for r in range(2)
+        ]
+        for p in procs:
+            p.start()
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if all((d / f"rank{r}.txt").is_file() for r in range(2)):
+                break
+            time.sleep(0.2)
+        for p in procs:
+            p.join(timeout=15)
+        return [(d / f"rank{r}.txt").read_text(encoding="utf-8") for r in range(2)]
+
+    happy = _run(fail_rank=-1, tag="happy")
+    assert all(t.startswith("ok|") for t in happy)
+    sad = _run(fail_rank=1, tag="sad")
+    assert all(t.startswith("fail|") for t in sad)
+    assert any("boom-rank1" in t for t in sad)
 
 
 def test_single_process_collectives_are_local():
@@ -241,7 +324,11 @@ def _ddp_worker(rank: int, world: int, port: int, tmp: str):
         "loss": result["final_loss"],
         "vae": _sig(trainer.system.vae.state_dict()),
         "disc": _sig(trainer.discriminator.state_dict()),
+        "ema": _sig(trainer.ema.shadow) if trainer.ema is not None else {},
         "wrote_metrics": (Path(tmp) / "metrics_train.jsonl").is_file(),
+        "val_n": int(trainer.val_n),
+        "val_batch_size": int(trainer.val_batch_size),
+        "wrote_val": (Path(tmp) / "metrics_val.jsonl").is_file(),
     }
     (Path(tmp) / f"rank{rank}.json").write_text(_json.dumps(payload) + "\n", encoding="utf-8")
     # Do not destroy the process group here: the peer may still be writing.
@@ -281,11 +368,23 @@ def test_gloo_two_process_train_syncs_vae_and_disc(tmp_path):
     for k, a in by_rank[0]["disc"].items():
         b = by_rank[1]["disc"][k]
         assert a == pytest.approx(b, abs=1e-4, rel=1e-3), k
+    assert by_rank[0]["ema"]
+    for k, a in by_rank[0]["ema"].items():
+        b = by_rank[1]["ema"][k]
+        assert a == pytest.approx(b, abs=1e-4, rel=1e-3), k
     # File exists (rank0 wrote). We cannot see rank1 skip from this process; rank0 must have written.
     assert by_rank[0]["wrote_metrics"] is True
     lines = (tmp_path / "ddp" / "metrics_train.jsonl").read_text(encoding="utf-8").strip().splitlines()
     # log_every_steps=1, 2 optimizer steps → 2 lines if only rank0 writes
     assert len(lines) == 2
+    assert by_rank[0]["wrote_val"] is True
+    assert by_rank[0]["val_n"] == by_rank[1]["val_n"]
+    assert by_rank[0]["val_batch_size"] == 8
+    val_lines = (tmp_path / "ddp" / "metrics_val.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(val_lines) == 1
+    rec = json.loads(val_lines[0])
+    assert rec["n_pages"] == by_rank[0]["val_n"]
+    assert rec["step"] == 2
 
 
 def test_single_process_smoke_unchanged(tmp_path):

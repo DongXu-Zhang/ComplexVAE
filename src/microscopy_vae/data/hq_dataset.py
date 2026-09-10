@@ -339,6 +339,31 @@ class ManifestHQDataset(Dataset):
         }
 
 
+class IndexedView(Dataset):
+    """Rank-local view of a dataset. Adds ``metadata.dataset_index`` (global).
+
+    Does not pad. Empty ``indices`` is valid (this rank has no val items).
+    """
+
+    def __init__(self, base: Dataset, indices: Sequence[int]) -> None:
+        self.base = base
+        self.indices = [int(i) for i in indices]
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, i: int) -> Dict[str, Any]:
+        idx = self.indices[int(i)]
+        item = self.base[idx]
+        if not isinstance(item, dict):
+            raise TypeError("IndexedView expects dict samples")
+        out = dict(item)
+        md = dict(out.get("metadata") or {})
+        md["dataset_index"] = int(idx)
+        out["metadata"] = md
+        return out
+
+
 def collate_hq(batch: List[Dict[str, Any]]) -> HQBatch:
     hq = torch.stack([b["hq"] for b in batch], dim=0)
     return HQBatch(

@@ -595,6 +595,109 @@ def pair_overlaps(origins: Sequence[int], tile_size: int) -> List[int]:
     return ov
 
 
+def halo_jobs(
+    h: int,
+    w: int,
+    boxes: Sequence[Tuple[int, int, int, int]],
+    halo: int,
+) -> List[Dict[str, int]]:
+    """Per-core forward window clipped to the real canvas. GPU count must not change this."""
+    halo = max(int(halo), 0)
+    jobs: List[Dict[str, int]] = []
+    for i, (y0, x0, y1, x1) in enumerate(boxes):
+        hy0 = max(0, int(y0) - halo)
+        hx0 = max(0, int(x0) - halo)
+        hy1 = min(int(h), int(y1) + halo)
+        hx1 = min(int(w), int(x1) + halo)
+        jobs.append(
+            {
+                "index": int(i),
+                "y0": int(y0),
+                "x0": int(x0),
+                "y1": int(y1),
+                "x1": int(x1),
+                "hy0": int(hy0),
+                "hx0": int(hx0),
+                "hy1": int(hy1),
+                "hx1": int(hx1),
+            }
+        )
+    return jobs
+
+
+def crop_halo_core(recon_window: torch.Tensor, job: Dict[str, int]) -> torch.Tensor:
+    cy0 = int(job["y0"]) - int(job["hy0"])
+    cx0 = int(job["x0"]) - int(job["hx0"])
+    th = int(job["y1"]) - int(job["y0"])
+    tw = int(job["x1"]) - int(job["x0"])
+    core = recon_window[:, :, cy0 : cy0 + th, cx0 : cx0 + tw]
+    if core.shape[-2] != th or core.shape[-1] != tw:
+        raise RuntimeError(
+            f"halo core shape {tuple(core.shape[-2:])} != {(th, tw)} at "
+            f"{(job['y0'], job['x0'])}"
+        )
+    return core
+
+
+def fuse_halo_cores(
+    x: torch.Tensor,
+    jobs: Sequence[Dict[str, int]],
+    cores: Sequence[torch.Tensor],
+    *,
+    tile_size: int,
+    overlap: int,
+    padding_mode: str,
+    blend_mode: str,
+    halo: int,
+    return_aux: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, Any]]:
+    if len(jobs) != len(cores):
+        raise ValueError(f"jobs ({len(jobs)}) vs cores ({len(cores)})")
+    x_work, small_pad = pad_if_smaller(x, tile_size, mode=padding_mode)
+    h, w = x_work.shape[-2:]
+    out = torch.zeros_like(x_work)
+    weight = torch.zeros((x_work.shape[0], 1, h, w), device=x_work.device, dtype=x_work.dtype)
+    tile_meta: List[Dict[str, int]] = []
+    for job, core in zip(jobs, cores):
+        y0, x0, y1, x1 = int(job["y0"]), int(job["x0"]), int(job["y1"]), int(job["x1"])
+        core_t = core.to(device=x_work.device, dtype=x_work.dtype)
+        th, tw = y1 - y0, x1 - x0
+        wgt = tile_blend_window(
+            y0, x0, th, tw, h, w, overlap, mode=blend_mode, device=x_work.device, dtype=x_work.dtype
+        ).view(1, 1, th, tw)
+        out[:, :, y0:y1, x0:x1] += core_t * wgt
+        weight[:, :, y0:y1, x0:x1] += wgt
+        tile_meta.append(
+            {
+                "y0": y0,
+                "x0": x0,
+                "halo_y0": int(job["hy0"]),
+                "halo_x0": int(job["hx0"]),
+                "halo_h": int(job["hy1"]) - int(job["hy0"]),
+                "halo_w": int(job["hx1"]) - int(job["hx0"]),
+            }
+        )
+    if float(weight.min()) <= 0:
+        raise RuntimeError("halo weight map has zeros; coverage is incomplete")
+    fused = out / weight
+    y_out = unpad(fused, small_pad)
+    if y_out.shape[-2:] != x.shape[-2:]:
+        raise RuntimeError(f"halo recon shape {tuple(y_out.shape)} != input {tuple(x.shape)}")
+    if not return_aux:
+        return y_out
+    aux = {
+        "mode": "halo",
+        "input_hw": [int(x.shape[-2]), int(x.shape[-1])],
+        "tile_size": int(tile_size),
+        "overlap": int(overlap),
+        "halo": int(halo),
+        "n_tiles": len(tile_meta),
+        "tiles": tile_meta,
+        "context": "real_image_crop",
+    }
+    return y_out, aux
+
+
 @torch.no_grad()
 def reconstruct_halo(
     model,
@@ -633,60 +736,25 @@ def reconstruct_halo(
         raise ValueError(
             f"tile_size={tile_size} must be divisible by spatial_compression={spatial_compression}"
         )
-    x_work, small_pad = pad_if_smaller(x, tile_size, mode=padding_mode)
+    x_work, _small_pad = pad_if_smaller(x, tile_size, mode=padding_mode)
     h, w = x_work.shape[-2:]
     boxes = tile_boxes(h, w, tile_size, overlap, snap=spatial_compression)
-    out = torch.zeros_like(x_work)
-    weight = torch.zeros((x_work.shape[0], 1, h, w), device=x_work.device, dtype=x_work.dtype)
-    tile_meta: List[Dict[str, int]] = []
-    for y0, x0, y1, x1 in boxes:
-        hy0 = max(0, y0 - halo)
-        hx0 = max(0, x0 - halo)
-        hy1 = min(h, y1 + halo)
-        hx1 = min(w, x1 + halo)
-        window = x_work[:, :, hy0:hy1, hx0:hx1]
+    jobs = halo_jobs(h, w, boxes, halo)
+    cores: List[torch.Tensor] = []
+    for job in jobs:
+        window = x_work[:, :, job["hy0"] : job["hy1"], job["hx0"] : job["hx1"]]
         recon_w = reconstruct_one_tile(
             model, window, spatial_compression=spatial_compression, padding_mode=padding_mode
         )
-        cy0 = y0 - hy0
-        cx0 = x0 - hx0
-        th, tw = y1 - y0, x1 - x0
-        core = recon_w[:, :, cy0 : cy0 + th, cx0 : cx0 + tw]
-        if core.shape[-2] != th or core.shape[-1] != tw:
-            raise RuntimeError(
-                f"halo core shape {tuple(core.shape[-2:])} != {(th, tw)} at {(y0, x0)}"
-            )
-        wgt = tile_blend_window(
-            y0, x0, th, tw, h, w, overlap, mode=blend_mode, device=x_work.device, dtype=x_work.dtype
-        ).view(1, 1, th, tw)
-        out[:, :, y0:y1, x0:x1] += core * wgt
-        weight[:, :, y0:y1, x0:x1] += wgt
-        tile_meta.append(
-            {
-                "y0": int(y0),
-                "x0": int(x0),
-                "halo_y0": int(hy0),
-                "halo_x0": int(hx0),
-                "halo_h": int(hy1 - hy0),
-                "halo_w": int(hx1 - hx0),
-            }
-        )
-    if float(weight.min()) <= 0:
-        raise RuntimeError("halo weight map has zeros; coverage is incomplete")
-    fused = out / weight
-    y_out = unpad(fused, small_pad)
-    if y_out.shape[-2:] != x.shape[-2:]:
-        raise RuntimeError(f"halo recon shape {tuple(y_out.shape)} != input {tuple(x.shape)}")
-    if not return_aux:
-        return y_out
-    aux = {
-        "mode": "halo",
-        "input_hw": [int(x.shape[-2]), int(x.shape[-1])],
-        "tile_size": int(tile_size),
-        "overlap": int(overlap),
-        "halo": int(halo),
-        "n_tiles": len(tile_meta),
-        "tiles": tile_meta,
-        "context": "real_image_crop",
-    }
-    return y_out, aux
+        cores.append(crop_halo_core(recon_w, job))
+    return fuse_halo_cores(
+        x,
+        jobs,
+        cores,
+        tile_size=tile_size,
+        overlap=overlap,
+        padding_mode=padding_mode,
+        blend_mode=blend_mode,
+        halo=halo,
+        return_aux=return_aux,
+    )

@@ -102,8 +102,8 @@ def init_distributed() -> DistInfo:
         device = torch.device("cpu")
     from datetime import timedelta
 
-    # Rank0-only work (focus sidecar, val) parks other ranks in a collective.
-    # Default NCCL timeout (~10 min) would kill a 150k run during the first val.
+    # Rank0-only work (focus sidecar, first-fit normalizer) parks other ranks
+    # in a collective. Default NCCL timeout (~10 min) would kill a 150k run.
     timeout_min = int(os.environ.get("MICROVAE_DDP_TIMEOUT_MIN", "360"))
     timeout = timedelta(minutes=max(timeout_min, 1))
     pg_kwargs: Dict[str, Any] = {
@@ -187,6 +187,38 @@ def broadcast_object(obj: Any, info: DistInfo, src: int = 0) -> Any:
     return payload[0]
 
 
+def strided_indices(n: int, rank: int, world_size: int) -> list:
+    """Split ``range(n)`` across ranks with no padding and no duplicates.
+
+    Rank r owns ``r, r+world, r+2*world, ...``. A rank may receive zero
+    indices when ``n < world_size``. This is the val/infer shard, not the
+    train hierarchical sampler.
+    """
+    n = int(n)
+    rank = int(rank)
+    world_size = max(int(world_size), 1)
+    if n < 0:
+        raise ValueError(f"n must be >= 0, got {n}")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"rank={rank} out of range for world_size={world_size}")
+    return list(range(rank, n, world_size))
+
+
+def all_gather_objects(obj: Any, info: DistInfo) -> list:
+    """Gather python objects on the Gloo control group (safe after DDP steps)."""
+    if not info.enabled:
+        return [obj]
+    import torch.distributed as dist
+
+    gathered: list = [None] * info.world_size
+    group = _object_group(info)
+    if group is not None:
+        dist.all_gather_object(gathered, obj, group=group)
+    else:
+        dist.all_gather_object(gathered, obj)
+    return gathered
+
+
 def all_reduce_sum(t: torch.Tensor, info: DistInfo) -> torch.Tensor:
     if not info.enabled:
         return t
@@ -216,13 +248,22 @@ def all_reduce_max_flag(flag: bool, info: DistInfo, device: torch.device) -> boo
 
 
 def raise_if_any_rank_failed(ok: bool, message: str, info: DistInfo) -> None:
-    """If any rank failed, every rank raises (avoids a NCCL/Gloo hang)."""
+    """If any rank failed, every rank raises (avoids a NCCL/Gloo hang).
+
+    Happy path is a 1-int all_reduce (NCCL). Object gather only runs on failure.
+    """
     if not info.enabled:
         if not ok:
             raise RuntimeError(message)
         return
     import torch.distributed as dist
 
+    flag = torch.zeros((), device=info.device, dtype=torch.int32)
+    if not ok:
+        flag.fill_(1)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    if int(flag.item()) == 0:
+        return
     gathered: list = [None] * info.world_size
     payload = None if ok else str(message)
     group = _object_group(info)
@@ -233,6 +274,7 @@ def raise_if_any_rank_failed(ok: bool, message: str, info: DistInfo) -> None:
     fails = [m for m in gathered if m is not None]
     if fails:
         raise RuntimeError(" | ".join(str(m) for m in fails))
+    raise RuntimeError(message or "rank failed")
 
 
 def assert_resume_world_size(ckpt_world_size: Optional[int], live_world_size: int) -> None:
@@ -336,12 +378,10 @@ def resolve_per_device_batch(
     rank_budget = original // world_size
     if rank_budget < 1:
         raise ValueError(f"effective global batch {original} is smaller than world_size={world_size}")
-    if rank_budget % yaml_accum == 0:
-        per_device = rank_budget // yaml_accum
-        accum = yaml_accum
-    else:
-        per_device = 1
-        accum = rank_budget
+    # Prefer a larger per-device batch (accum=1) so 4-GPU is 2×1 not 1×2.
+    # Same global product; GroupNorm is per-sample so this is not a BN shift.
+    per_device = int(rank_budget)
+    accum = 1
     if per_device < 1:
         raise ValueError("resolved per_device_batch_size < 1")
     return int(per_device), int(accum), int(original)

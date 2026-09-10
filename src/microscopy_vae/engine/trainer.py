@@ -12,11 +12,17 @@ from microscopy_vae import __version__
 from microscopy_vae.config.loader import dump_resolved
 from microscopy_vae.config.schema import RootConfig
 from microscopy_vae.config.validation import validate_for_training
-from microscopy_vae.data.hq_dataset import ManifestHQDataset, SyntheticHQDataset, collate_hq
+from microscopy_vae.data.hq_dataset import (
+    IndexedView,
+    ManifestHQDataset,
+    SyntheticHQDataset,
+    collate_hq,
+)
 from microscopy_vae.data.manifest import load_hq_manifest, manifest_sha256, summarize_records
 from microscopy_vae.data.normalization import (
     NormalizationState,
     Normalizer,
+    affine_formula,
     assert_artifact_matches_config,
     fit_robust_normalizer,
 )
@@ -28,6 +34,7 @@ from microscopy_vae.engine.distributed import (
     all_reduce_max_flag,
     assert_resume_world_size,
     barrier,
+    strided_indices,
     broadcast_object,
     cleanup_distributed,
     init_distributed,
@@ -171,12 +178,7 @@ class Trainer:
         except Exception as exc:  # noqa: BLE001
             self.source_sha = f"unavailable:{exc}"
         seed_everything(cfg.experiment.seed, cfg.reproducibility.deterministic)
-        if self.dist.enabled:
-            from microscopy_vae.utils.rng import derive_seed
-
-            torch.manual_seed(derive_seed(int(cfg.experiment.seed), int(self.dist.rank)))
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(derive_seed(int(cfg.experiment.seed), int(self.dist.rank), 1))
+        # Rank-specific torch seeds are applied after model + EMA + DDP wrap.
 
         self.system = build_hq_codec_system(cfg).to(self.device)
         self.logger.info(
@@ -206,11 +208,20 @@ class Trainer:
         self._enter_train_mode()
 
         # Optional resume_exact after optim built, before DDP wrap (same weights on all ranks).
+        ema_from_ckpt = False
         if cfg.training.resume_exact_path:
-            self._resume_exact(Path(cfg.training.resume_exact_path))
+            ema_from_ckpt = bool(self._resume_exact(Path(cfg.training.resume_exact_path)))
         elif cfg.training.warmstart_vae_path:
-            self._warmstart_vae(Path(cfg.training.warmstart_vae_path))
+            ema_from_ckpt = bool(self._warmstart_vae(Path(cfg.training.warmstart_vae_path)))
         self._wrap_ddp()
+        if self.ema is not None and not ema_from_ckpt:
+            self.ema.resync_from(self.system.vae)
+        if self.dist.enabled:
+            from microscopy_vae.utils.rng import derive_seed
+
+            torch.manual_seed(derive_seed(int(cfg.experiment.seed), int(self.dist.rank)))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(derive_seed(int(cfg.experiment.seed), int(self.dist.rank), 1))
 
         # Prove no test loader attribute for training API
         assert not hasattr(self, "test_loader")
@@ -371,10 +382,11 @@ class Trainer:
                 )
                 self.normalizer_sha = state.save(self.run_dir / "normalizer.json")
                 self.logger.info(
-                    "normalizer scale_mode=%s fit_mode=%s floor=%s p_high=%g low=%.6g high=%.6g pages=%s sources=%s",
+                    "normalizer scale_mode=%s fit_mode=%s floor=%s affine=%s p_high=%g low=%.6g high=%.6g pages=%s sources=%s",
                     state.scale_mode,
                     state.fit_mode,
                     state.raw_floor_enabled,
+                    affine_formula(state),
                     state.high_percentile,
                     state.low,
                     state.high,
@@ -408,12 +420,14 @@ class Trainer:
             raise RuntimeError("Normalizer fit_split must be train")
         self._assert_per_source_coverage()
         if self.normalizer.is_per_source():
+            formula = affine_formula(self.normalizer.state)
             for src, sc in sorted(self.normalizer.state.per_source_scales.items()):
                 self.logger.info(
-                    "per-source scale %s low=%.6g high=%.6g (y = max(x,0)/high)",
+                    "per-source scale %s low=%.6g high=%.6g (%s)",
                     src,
                     float(sc["low"]),
                     float(sc["high"]),
+                    formula,
                 )
 
         crop_mode = str(getattr(cfg.crop, "mode", "random"))
@@ -500,11 +514,26 @@ class Trainer:
             drop_last=True,
             **self._dataloader_kwargs(int(cfg.training.num_workers), persistent=True),
         )
+        val_bs = int(getattr(cfg.evaluation, "batch_size", None) or 0)
+        if val_bs < 1:
+            val_bs = 8
+        self.val_batch_size = int(val_bs)
+        self.val_n = int(len(self.val_set))
+        val_idx = strided_indices(self.val_n, int(self.dist.rank), int(self.dist.world_size))
         self.val_loader = DataLoader(
-            self.val_set,
-            batch_size=self.per_device_batch,
+            IndexedView(self.val_set, val_idx),
+            batch_size=self.val_batch_size,
             shuffle=False,
+            drop_last=False,
             **self._dataloader_kwargs(min(2, int(cfg.training.num_workers)), persistent=False),
+        )
+        self.logger.info(
+            "val shard rank=%s n_local=%s n_global=%s batch_size=%s (not train microbatch=%s)",
+            self.dist.rank,
+            len(val_idx),
+            self.val_n,
+            self.val_batch_size,
+            self.per_device_batch,
         )
 
     def _dataloader_kwargs(self, num_workers: int, *, persistent: bool) -> Dict[str, Any]:
@@ -820,7 +849,7 @@ class Trainer:
             raise RuntimeError(f"checkpoint save failed: {err}")
         return path
 
-    def _warmstart_vae(self, path: Path) -> None:
+    def _warmstart_vae(self, path: Path) -> bool:
         self.logger.info("warmstart VAE weights from %s (optim/step reset, not resume_exact)", path)
         CheckpointManager.load_exported_weights(path, self.system.vae, map_location=str(self.device))
         payload = None
@@ -829,14 +858,18 @@ class Trainer:
         except TypeError:
             payload = torch.load(path, map_location=str(self.device))
         extra = payload.get("extra") if isinstance(payload, dict) else None
+        loaded_ema = False
         if self.ema is not None and isinstance(extra, dict) and extra.get("ema"):
             self.ema.load_state_dict(extra["ema"])
+            loaded_ema = True
         # Discriminator / perc stay freshly built for this config. Trainer state is step 0.
+        return loaded_ema
 
-    def _resume_exact(self, path: Path) -> None:
+    def _resume_exact(self, path: Path) -> bool:
         self.logger.info("resume_exact from %s", path)
         err = ""
         extra: Dict[str, Any] = {}
+        loaded_ema = False
         try:
             self.state, extra = CheckpointManager.resume_exact(
                 path,
@@ -852,6 +885,7 @@ class Trainer:
             extra = extra or {}
             if self.ema is not None and isinstance(extra, dict) and extra.get("ema"):
                 self.ema.load_state_dict(extra["ema"])
+                loaded_ema = True
             if self.system.perceptual is not None:
                 if extra.get("perceptual"):
                     self.system.perceptual.load_state_dict(extra["perceptual"])
@@ -877,6 +911,7 @@ class Trainer:
         except Exception as exc:  # noqa: BLE001
             err = f"{type(exc).__name__}: {exc}"
         raise_if_any_rank_failed(not err, err or "resume_exact failed", self.dist)
+        return loaded_ema
 
     def _assert_finite_grads(self) -> None:
         bad = []
@@ -1091,25 +1126,29 @@ class Trainer:
         )
         return last_diag
 
+    def _enter_eval_mode(self) -> None:
+        self.system.eval()
+        if self.system.perceptual is not None:
+            self.system.perceptual.eval()
+
     def _maybe_validate(self) -> Optional[Dict[str, Any]]:
-        """Rank0 runs val. Every rank rendezvous so a rank0 exception cannot hang peers."""
+        """All ranks run a disjoint val shard, then gather. Rank0 writes logs/ckpts."""
         err = ""
         rec = None
-        if self.dist.is_main:
-            try:
-                rec = self._validate_on_main()
-            except Exception as exc:  # noqa: BLE001
-                err = f"{type(exc).__name__}: {exc}"
-        err = broadcast_object(err, self.dist, src=0)
-        if err:
-            raise RuntimeError(f"validation failed: {err}")
+        try:
+            rec = self._validate_all_ranks()
+        except Exception as exc:  # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+        raise_if_any_rank_failed(not err, err or "validation failed", self.dist)
+        rec = broadcast_object(rec, self.dist, src=0)
         return rec
 
-    def _validate_on_main(self) -> Dict[str, Any]:
+    def _validate_all_ranks(self) -> Dict[str, Any]:
         use_ema = bool(getattr(self.cfg.evaluation, "use_ema_for_val", True)) and self.ema is not None
         live_sd = None
+        self._enter_eval_mode()
         if use_ema:
-            live_sd = {k: v.detach().cpu().clone() for k, v in self.system.vae.state_dict().items()}
+            live_sd = {k: v.detach().clone() for k, v in self.system.vae.state_dict().items()}
             self.ema.copy_to(self.system.vae)
         boot_n = min(
             int(getattr(self.cfg.evaluation, "max_bootstrap", 200)),
@@ -1126,6 +1165,8 @@ class Trainer:
                 getattr(self.cfg.evaluation, "report_constant_baseline", True)
             ),
             extended_metrics=bool(getattr(self.cfg.evaluation, "extended_metrics", False)),
+            dist=self.dist,
+            expected_n=int(self.val_n),
         )
         if use_ema and live_sd is not None:
             self.system.vae.load_state_dict(live_sd)
@@ -1140,37 +1181,38 @@ class Trainer:
             "n_groups": metrics["n_groups"],
             "psnr_bootstrap": metrics["psnr_bootstrap"],
         }
-        append_jsonl(self.run_dir / "metrics_val.jsonl", rec)
-        self.logger.info(
-            "val step=%s weights=%s psnr=%.4f mae=%.6f nmse=%.4f ssim_local=%.4f "
-            "ssim_range1=%.4f snr=%.4f pooled=%.4f by_source_psnr=%s",
-            self.state.optimizer_step,
-            rec["weights"],
-            metrics["group_macro"].get("psnr", float("nan")),
-            metrics["group_macro"].get("mae", float("nan")),
-            metrics["group_macro"].get("nmse", float("nan")),
-            metrics["group_macro"].get("ssim_local", float("nan")),
-            metrics["group_macro"].get("ssim_range1", float("nan")),
-            metrics["group_macro"].get("snr_db", float("nan")),
-            metrics["group_macro"].get("psnr_mse_pooled", float("nan")),
-            {k: v.get("psnr") for k, v in (metrics.get("by_source") or {}).items()},
-        )
-        self._maybe_save_best(metrics, rec)
-        if self.state.optimizer_step in set(self.cfg.training.candidate_steps):
-            tag = f"candidate_step_{self.state.optimizer_step:07d}"
-            path = self.ckpt.save_exact(
-                tag=tag,
-                model=self.system.vae,
-                optimizer=self.optimizer,
-                scheduler=self.scheduler,
-                scaler=self.scaler,
-                state=self.state,
-                config_sha256=self.config_sha,
-                normalizer_sha256=self.normalizer_sha,
-                code_version=__version__,
-                extra=self._ckpt_extra(candidate=True, val=rec),
+        if self.dist.is_main:
+            append_jsonl(self.run_dir / "metrics_val.jsonl", rec)
+            self.logger.info(
+                "val step=%s weights=%s psnr=%.4f mae=%.6f nmse=%.4f ssim_local=%.4f "
+                "ssim_range1=%.4f snr=%.4f pooled=%.4f by_source_psnr=%s",
+                self.state.optimizer_step,
+                rec["weights"],
+                metrics["group_macro"].get("psnr", float("nan")),
+                metrics["group_macro"].get("mae", float("nan")),
+                metrics["group_macro"].get("nmse", float("nan")),
+                metrics["group_macro"].get("ssim_local", float("nan")),
+                metrics["group_macro"].get("ssim_range1", float("nan")),
+                metrics["group_macro"].get("snr_db", float("nan")),
+                metrics["group_macro"].get("psnr_mse_pooled", float("nan")),
+                {k: v.get("psnr") for k, v in (metrics.get("by_source") or {}).items()},
             )
-            self.state.candidate_hits[self.state.optimizer_step] = str(path)
+            self._maybe_save_best(metrics, rec)
+            if self.state.optimizer_step in set(self.cfg.training.candidate_steps):
+                tag = f"candidate_step_{self.state.optimizer_step:07d}"
+                path = self.ckpt.save_exact(
+                    tag=tag,
+                    model=self.system.vae,
+                    optimizer=self.optimizer,
+                    scheduler=self.scheduler,
+                    scaler=self.scaler,
+                    state=self.state,
+                    config_sha256=self.config_sha,
+                    normalizer_sha256=self.normalizer_sha,
+                    code_version=__version__,
+                    extra=self._ckpt_extra(candidate=True, val=rec),
+                )
+                self.state.candidate_hits[self.state.optimizer_step] = str(path)
         return rec
 
     def _maybe_save_best(self, metrics: Dict[str, Any], rec: Dict[str, Any]) -> None:
@@ -1252,14 +1294,15 @@ class Trainer:
             audit_msg = f"{type(exc).__name__}: {exc}"
         raise_if_any_rank_failed(audit_ok, audit_msg, self.dist)
 
+        log_every = int(self.cfg.training.log_every_steps)
         while self.state.optimizer_step < max_steps:
-            loss_accum = 0.0
             last_diag: Dict[str, Any] = {}
             last_loss_out = None
             last_batch = None
             d_used_any = False
             if self.disc_optimizer is not None:
                 self.disc_optimizer.zero_grad(set_to_none=True)
+            loss_accum_t = None
             for _micro in range(accum):
                 fetch_err = ""
                 try:
@@ -1294,15 +1337,17 @@ class Trainer:
                             batch, optimizer_step=self.state.optimizer_step
                         )
                     loss_out = self._attach_adv_g(loss_out, batch)
-                    last_diag.update(
-                        quantify_generator_losses(
-                            loss_out.unweighted,
-                            loss_out.weights,
-                            loss_out.weighted,
-                            total=loss_out.total,
+                    will_log = log_every > 0 and (self.state.optimizer_step + 1) % log_every == 0
+                    if last_micro and will_log:
+                        last_diag.update(
+                            quantify_generator_losses(
+                                loss_out.unweighted,
+                                loss_out.weights,
+                                loss_out.weighted,
+                                total=loss_out.total,
+                            )
                         )
-                    )
-                    last_diag.update(self._maybe_influence(loss_out, last_micro))
+                    last_diag.update(self._maybe_influence(loss_out, last_micro and will_log))
                     last_diag.update(self._backward_disc(loss_out, batch, accum))
                     d_used_any = d_used_any or bool(getattr(self, "_disc_used_real", False))
                     if self.discriminator is not None:
@@ -1317,16 +1362,18 @@ class Trainer:
                     f"samples={batch.sample_ids} sources={batch.sources} d_ok={d_ok}",
                     self.dist,
                 )
-                loss_accum += float(loss_out.total.detach().cpu())
+                det = loss_out.total.detach()
+                loss_accum_t = det if loss_accum_t is None else loss_accum_t + det
                 last_loss_out = loss_out
                 last_batch = batch
-                last_diag.update(
-                    {
-                        k: float(v.detach().cpu())
-                        for k, v in loss_out.diagnostics.items()
-                        if torch.is_tensor(v) and v.ndim == 0
-                    }
-                )
+                if last_micro and will_log:
+                    last_diag.update(
+                        {
+                            k: float(v.detach().item())
+                            for k, v in loss_out.diagnostics.items()
+                            if torch.is_tensor(v) and v.ndim == 0
+                        }
+                    )
                 self.state.microbatch += 1
                 self.state.global_samples += int(batch.hq.shape[0]) * int(self.dist.world_size)
 
@@ -1387,14 +1434,14 @@ class Trainer:
                 self.ema.update(self.system.vae)
             self.optimizer.zero_grad(set_to_none=True)
             self.state.optimizer_step += 1
-            step_loss = loss_accum / accum
-            last_diag = self._reduce_train_diag(last_diag, step_loss)
-            history.append(float(last_diag.get("loss", step_loss)))
+            step_loss = float((loss_accum_t / accum).item()) if loss_accum_t is not None else 0.0
+            history.append(step_loss)
 
-            if self.state.optimizer_step % self.cfg.training.log_every_steps == 0:
+            if log_every > 0 and self.state.optimizer_step % log_every == 0:
+                last_diag = self._reduce_train_diag(last_diag, step_loss)
                 rec = {
                     "step": self.state.optimizer_step,
-                    "loss": history[-1],
+                    "loss": float(last_diag.get("loss", step_loss)),
                     "lr": self.optimizer.param_groups[0]["lr"],
                     "grad_norm_pre_clip": last_diag.get("grad_norm_pre_clip", pre_clip),
                     "grad_clipped": pre_clip > float(self.cfg.training.grad_clip_norm or 0),

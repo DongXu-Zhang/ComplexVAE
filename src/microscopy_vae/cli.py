@@ -322,6 +322,83 @@ def _save_float_image(path: Path, arr) -> None:
         atomic_write_bytes(path, buf.getvalue())
 
 
+def _cmd_infer_many(args: argparse.Namespace) -> int:
+    """Multi-image full inference. Does not convert full → tiled."""
+    cfg = _cfg(args)
+    from microscopy_vae.systems.factory import build_hq_codec_system
+    from microscopy_vae.inference.compare import load_infer_weights
+    from microscopy_vae.inference.devices import parse_devices, primary_device
+    from microscopy_vae.inference.parallel import run_full_images
+    from microscopy_vae.data.readers import read_page
+    import numpy as np
+
+    mode = str(getattr(args, "inference_mode", None) or getattr(cfg.inference, "default_mode", "full"))
+    if mode != "full":
+        raise SystemExit(
+            "--input-list currently supports --inference-mode full only. "
+            "Do not silently switch to tiled/halo. Run each file with --input instead."
+        )
+    out_dir = Path(args.output_dir or args.output or "")
+    if not str(out_dir):
+        raise SystemExit("--input-list requires --output-dir")
+    lines = [
+        ln.strip()
+        for ln in Path(args.input_list).read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    if not lines:
+        raise SystemExit("input-list is empty")
+    devices = parse_devices(str(getattr(args, "devices", None) or "auto"))
+    primary = primary_device(devices)
+    system = build_hq_codec_system(cfg)
+    if args.weights:
+        load_infer_weights(
+            Path(args.weights), system.vae, use_ema=not bool(getattr(args, "raw_weights", False))
+        )
+    system.eval()
+    tensors = []
+    stems = []
+    sources = []
+    for p in lines:
+        path = Path(p)
+        norm, src = _bind_infer_normalizer(cfg, args, path_for_source=str(path))
+        page, _ = read_page(path, int(args.page))
+        x_np = norm.transform(page, source=src) if norm is not None else page.astype(np.float32)
+        x = torch.from_numpy(np.ascontiguousarray(x_np)).unsqueeze(0).unsqueeze(0)
+        tensors.append(x)
+        stems.append(path.stem)
+        sources.append((norm, src))
+    f = int(system.vae.spatial_compression)
+    pad_mode = str(getattr(args, "padding_mode", None) or "reflect")
+    ys = run_full_images(
+        system.vae,
+        tensors,
+        cfg_dump=resolved_dict(cfg),
+        devices=list(devices),
+        spatial_compression=f,
+        padding_mode=pad_mode,
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for stem, y, (norm, src) in zip(stems, ys, sources):
+        y_np = y.squeeze().detach().cpu().numpy().astype(np.float32)
+        if norm is not None:
+            y_np = norm.inverse(y_np, source=src)
+        _save_float_image(out_dir / f"{stem}.npy", y_np)
+    print(
+        json.dumps(
+            {
+                "n": len(stems),
+                "output_dir": str(out_dir),
+                "devices": [str(d) for d in devices],
+                "mode": "full",
+                "primary_device": str(primary),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_infer(args: argparse.Namespace) -> int:
     cfg = _cfg(args)
     from microscopy_vae.systems.factory import build_hq_codec_system
@@ -333,8 +410,13 @@ def cmd_infer(args: argparse.Namespace) -> int:
     from microscopy_vae.data.readers import read_page
     import numpy as np
 
+    input_list = getattr(args, "input_list", None)
+    if input_list:
+        if args.input:
+            raise SystemExit("use either --input or --input-list, not both")
+        return _cmd_infer_many(args)
     if not args.input or not args.output:
-        raise SystemExit("infer requires --input and --output")
+        raise SystemExit("infer requires --input and --output (or --input-list and --output-dir)")
     norm, infer_source = _bind_infer_normalizer(cfg, args, path_for_source=args.input)
     mode = str(getattr(args, "inference_mode", None) or getattr(cfg.inference, "default_mode", "full"))
     # --tiled is a backward-compat alias only when mode was left at default full.
@@ -495,14 +577,16 @@ def cmd_infer(args: argparse.Namespace) -> int:
             info["tiled_aux"] = {k: v for k, v in aux.items() if k != "weight"}
             info["parallel"] = aux.get("parallel")
         elif mode == "halo":
-            from microscopy_vae.inference.tiling import reconstruct_halo
+            from microscopy_vae.inference.parallel import run_halo
 
             halo = int(getattr(args, "halo", None) or getattr(cfg.inference, "halo", 64) or 64)
             _sync()
             t0 = time.perf_counter()
-            y, aux = reconstruct_halo(
+            y, aux = run_halo(
                 system.vae,
                 x,
+                cfg_dump=resolved_dict(cfg),
+                devices=list(devices),
                 tile_size=tile_size,
                 overlap=overlap,
                 halo=halo,
@@ -513,8 +597,11 @@ def cmd_infer(args: argparse.Namespace) -> int:
             )
             _sync()
             info["forward_wall_s"] = float(time.perf_counter() - t0)
-            info["halo_aux"] = aux
-            info["parallel"] = {"mode": "none", "reason": "halo uses real context on one device"}
+            info["halo_aux"] = {k: v for k, v in aux.items() if k != "weight"}
+            info["parallel"] = aux.get("parallel") or {
+                "mode": "none",
+                "reason": "single device sequential halo",
+            }
         else:
             _sync()
             t0 = time.perf_counter()
@@ -1004,7 +1091,19 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "infer":
             sp.add_argument("--input", type=str, default=None)
+            sp.add_argument(
+                "--input-list",
+                type=str,
+                default=None,
+                help="text file of image paths (one per line) for multi-image full dispatch",
+            )
             sp.add_argument("--output", type=str, default=None)
+            sp.add_argument(
+                "--output-dir",
+                type=str,
+                default=None,
+                help="directory for --input-list outputs (stem.npy)",
+            )
             sp.add_argument("--weights", type=str, default=None)
             sp.add_argument("--normalizer", type=str, default=None)
             sp.add_argument("--page", type=int, default=0)

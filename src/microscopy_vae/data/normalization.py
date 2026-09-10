@@ -102,6 +102,7 @@ class NormalizationState:
             "threshold_version": str(self.threshold_version or ""),
             "threshold_sources": sorted(self.per_source_thresholds.keys()),
             "floor_before_normalize": bool(self.raw_floor_enabled),
+            "affine": affine_formula(self),
         }
 
 
@@ -202,14 +203,42 @@ def _percentile_pair(flat: np.ndarray, low_p: float, high_p: float) -> Tuple[flo
     return low, high
 
 
-def _maybe_lock_low_to_floor(low: float, high: float, *, floor_on: bool, floor_v: float) -> Tuple[float, float]:
-    """After raw floor, keep y=0 at intensity 0. Do not use p0.1 as low (that remaps zeros negative)."""
-    if not floor_on:
+def _maybe_lock_low(
+    low: float,
+    high: float,
+    *,
+    floor_on: bool,
+    floor_v: float,
+    scale_mode: str,
+) -> Tuple[float, float]:
+    """Pin the affine origin independently of whether negatives are floored.
+
+    - floor on: low = floor_v (V4–V6: y = max(x,0)/high).
+    - per_source and floor off: low = 0 so y = x/high (V8). Do not use p0/p0.1
+      as low — that remaps raw 0 away from network 0.
+    - global and floor off: keep percentile low (V2.2).
+    """
+    if floor_on:
+        locked = float(floor_v)
+    elif str(scale_mode) == "per_source":
+        locked = 0.0
+    else:
         return low, high
-    locked = float(floor_v)
     if high <= locked:
-        raise ValueError(f"high={high} must exceed raw floor {locked}")
+        raise ValueError(f"high={high} must exceed locked low {locked}")
     return locked, high
+
+
+def affine_formula(state: NormalizationState) -> str:
+    """Human-readable map actually applied by transform()."""
+    if bool(state.raw_floor_enabled):
+        v = float(state.raw_floor_value)
+        if abs(v) < 1e-12:
+            return "y = max(x,0)/high"
+        return f"y = (max(x,{v:g})-{v:g})/(high-{v:g})"
+    if str(state.scale_mode) == "per_source":
+        return "y = x/high"
+    return "y = (x-low)/(high-low)"
 
 
 def _resolve_percentiles(method: str, low_percentile: float, high_percentile: float) -> Tuple[float, float]:
@@ -278,6 +307,9 @@ def fit_robust_normalizer(
       - source_balanced: equal weight per source (recommended default for multi-source HQ)
 
     raw_floor_enabled: max(x, raw_floor_value) *before* percentiles and transform.
+    per_source always pins low to 0 (or to the floor value). Floor off then
+    yields y = x/high_s with signed values kept. global + floor off keeps the
+    percentile low (V2.2).
     """
     if method == IDENTITY_METHOD:
         return NormalizationState(
@@ -344,7 +376,9 @@ def fit_robust_normalizer(
             f = np.concatenate(flist)
             try:
                 lo, hi = _percentile_pair(f, low_p, high_p)
-                lo, hi = _maybe_lock_low_to_floor(lo, hi, floor_on=floor_on, floor_v=floor_v)
+                lo, hi = _maybe_lock_low(
+                    lo, hi, floor_on=floor_on, floor_v=floor_v, scale_mode=scale_mode_u
+                )
             except ValueError as exc:
                 raise ValueError(
                     f"source {s!r} has a degenerate range after floor "
@@ -381,7 +415,9 @@ def fit_robust_normalizer(
         flats = [_subsample(a, rng) for a in arrays]
         flat = np.concatenate(flats)
         low, high = _percentile_pair(flat, low_p, high_p)
-        low, high = _maybe_lock_low_to_floor(low, high, floor_on=floor_on, floor_v=floor_v)
+        low, high = _maybe_lock_low(
+            low, high, floor_on=floor_on, floor_v=floor_v, scale_mode=scale_mode_u
+        )
         used_mode = "page_uniform"
         n_above = int((flat > high).sum())
         per_source_stats["_union"] = {
@@ -397,7 +433,9 @@ def fit_robust_normalizer(
         for s, flist in sorted(by_src.items()):
             f = np.concatenate(flist)
             lo, hi = _percentile_pair(f, low_p, high_p)
-            lo, hi = _maybe_lock_low_to_floor(lo, hi, floor_on=floor_on, floor_v=floor_v)
+            lo, hi = _maybe_lock_low(
+                lo, hi, floor_on=floor_on, floor_v=floor_v, scale_mode=scale_mode_u
+            )
             lows.append(lo)
             highs.append(hi)
             n_above = int((f > hi).sum())
@@ -418,7 +456,9 @@ def fit_robust_normalizer(
         if high <= low:
             flat = np.concatenate([x for xs in by_src.values() for x in xs])
             low, high = _percentile_pair(flat, low_p, high_p)
-        low, high = _maybe_lock_low_to_floor(low, high, floor_on=floor_on, floor_v=floor_v)
+        low, high = _maybe_lock_low(
+            low, high, floor_on=floor_on, floor_v=floor_v, scale_mode=scale_mode_u
+        )
         used_mode = "source_balanced"
         for s, st in per_source_stats.items():
             f = np.concatenate(by_src[s])
@@ -613,7 +653,8 @@ def assert_artifact_matches_config(state: NormalizationState, cfg_norm: Any, *, 
         raise ValueError(
             "Normalizer artifact does not match config contract "
             f"(cfg floor={want_floor} p{want_low:g}/{want_high:g} method={method} "
-            f"scale_mode={want_scale} clip={want_clip} calibrate_thresholds={want_thr}; "
+            f"scale_mode={want_scale} clip={want_clip} calibrate_thresholds={want_thr} "
+            f"affine={affine_formula(state)!r}; "
             f"artifact floor={got_floor} p{got_low:g}/{got_high:g} method={state.method} "
             f"scale_mode={got_scale} clip={got_clip} "
             f"threshold_version={getattr(state, 'threshold_version', '')!r} "

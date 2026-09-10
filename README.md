@@ -1,6 +1,6 @@
 # ComplexVAE — Scratch Microscopy HQ Codec
 
-Package version **0.3.3**. Single-channel **KL-VAE** for high-quality microscopy images:
+Package version **0.3.5**. Single-channel **KL-VAE** for high-quality microscopy images:
 
 ```text
 HQ image → Encoder → latent z → Decoder → reconstruction
@@ -12,11 +12,22 @@ HQ image → Encoder → latent z → Decoder → reconstruction
 
 Topology is *inspired by* Hybrid-SD Small / Diffusers 0.27 Encoder–Decoder structure (asymmetric channels, f8, z=4) but implemented independently under `src/microscopy_vae/`.
 
-**Official next train (V6):** `configs/experiment/s1_hq_f8z4_v6.yaml` — V5 protocol, **GAN off**, support-floor v2 (low-gradient noise, not locked to 0.02), val logs `nmse` / `ssim_local`, production infer prefers full or halo over isolated 256 tiles.  
-**Frozen control (V5):** `configs/experiment/s1_hq_f8z4_v5.yaml` — do not overwrite its yaml or run dir. Do not load a V5 `normalizer.json` into V6.  
-**Frozen control (V4):** `configs/experiment/s1_hq_f8z4_v4.yaml`. Do not load f4 weights into f8. Train V6 from scratch.
+**Official next train (V8):** `configs/experiment/s1_hq_f8z4_v8.yaml` — V6 protocol with **raw floor off**. Per-source map is `y = x / H_source` (low pinned at 0; signed values kept). Do not reuse a V6/V5/V4 `normalizer.json`. Do not add Scharr/HF/Flux/GAN in this run.  
+**Frozen control (V6):** `configs/experiment/s1_hq_f8z4_v6.yaml` — `y = max(x,0)/H_source`. Do not overwrite its run dir.  
+**Frozen control (V5):** `configs/experiment/s1_hq_f8z4_v5.yaml`.  
+**Frozen control (V4):** `configs/experiment/s1_hq_f8z4_v4.yaml`. Do not load f4 weights into f8. Train V8 from scratch.
 
-V6 keeps V5's linear map (`y = max(x,0)/H_source`). Independent Scharr/HF/Flux/dark_fp weights stay 0. Infer native pages with `--inference-mode full` or `halo` (large `--tiled` upgrades to halo unless `--allow-isolated-tiles`). Frozen test split stays closed. Encode for LDM: `python -m microscopy_vae.cli encode ...` writes posterior mean in the **internal unscaled** domain; refit per-channel center/scale on **this** architecture's train latents (never reuse f4 stats on f8, never apply SD `0.18215`).
+Independent Scharr/HF/Flux/dark_fp weights stay 0. Infer native pages with `--inference-mode full` or `halo` (large `--tiled` upgrades to halo unless `--allow-isolated-tiles`). Frozen test split stays closed. Encode for LDM: `python -m microscopy_vae.cli encode ...` writes posterior mean in the **internal unscaled** domain; refit per-channel center/scale on **this** architecture's train latents (never reuse f4 stats on f8, never apply SD `0.18215`).
+
+## What 0.3.5 adds over 0.3.4
+
+Execution only (see `docs/MULTI_GPU.md`): val shards across DDP ranks with no padded duplicates; val batch is independent of train microbatch; one forward for recon+KL; 4 GPU keeps global batch 8 as **2×1**; EMA is re-cloned after DDP broadcasts rank0 weights; halo/full-multi-image infer can use several GPUs without changing window math. Recipe (losses, f8/z4, global batch 8, V8 `y=x/H_s`) is unchanged.
+
+## What 0.3.4 adds over 0.3.3 (V6)
+
+1. Official train is **V8** (`s1_hq_f8z4_v8.yaml`): same V6 losses/architecture, `raw_floor_enabled: false`.
+2. `scale_mode=per_source` always pins `low=0`, even when the raw floor is off, so `y = x/high_s`. Do not use p0/p0.1 as the origin (that remaps true zeros).
+3. Do not load a V6 `normalizer.json` into V8. V6 yaml is unchanged (`resume_exact` config hash is unchanged).
 
 ## What 0.3.3 adds over 0.3.2 (V5)
 
@@ -28,7 +39,7 @@ V6 keeps V5's linear map (`y = max(x,0)/H_source`). Independent Scharr/HF/Flux/d
 ## What 0.3.2 adds over 0.3.0 (V4)
 
 1. Official train is **V5** (`s1_hq_f8z4_v5.yaml`): same per-source map, plus train-fitted crop/support/amp gates and `empty_keep_prob=0.55`.
-2. Single-node DDP: `python -m` stays 1 GPU; `torchrun --standalone --nproc_per_node=2` splits the yaml global batch of 8 (2×2 per GPU). Do not set `ddp_scale_global_batch`.
+2. Single-node DDP: `python -m` stays 1 GPU; `torchrun --standalone --nproc_per_node=2` splits the yaml global batch of 8 (4×1 per GPU). Do not set `ddp_scale_global_batch`.
 3. Infer `--inference-mode halo` uses real image context around each tile (CLI-only).
 4. Do not load a V4 `normalizer.json` into a V5 config.
 
@@ -60,12 +71,13 @@ pip install -e ".[dev]"
 pip install torch  # choose the correct CUDA wheel
 ```
 
-Confirm you are on **0.3.3**:
+Confirm you are on **0.3.5**:
 
 ```bash
 git log -1 --oneline
 python -c "import microscopy_vae; print(microscopy_vae.__version__)"
-ls configs/experiment/s1_hq_f8z4_v6.yaml configs/experiment/s1_hq_f8z4_v5.yaml configs/experiment/s1_hq_f8z4_v4.yaml
+ls configs/experiment/s1_hq_f8z4_v8.yaml configs/experiment/s1_hq_f8z4_v6.yaml configs/experiment/s1_hq_f8z4_v5.yaml configs/experiment/s1_hq_f8z4_v4.yaml
+# 正式下一训：docs/NEXT_TRAIN_V8_CN.md  （四卡，全局 batch 仍是 8）
 ```
 
 ## Quick check (no real data)
@@ -73,52 +85,66 @@ ls configs/experiment/s1_hq_f8z4_v6.yaml configs/experiment/s1_hq_f8z4_v5.yaml c
 ```bash
 export PYTHONPATH=$PWD/src   # if not editable-installed
 python -m microscopy_vae.cli smoke-test --config configs/experiment/smoke_v5.yaml
-python -m pytest -q tests/unit/test_v5_protocol.py tests/unit/test_v4_protocol.py tests/unit/test_f8_protocol.py tests/unit/test_ddp.py
+python -m pytest -q tests/unit/test_v8_protocol.py tests/unit/test_v5_protocol.py tests/unit/test_v4_protocol.py tests/unit/test_f8_protocol.py tests/unit/test_ddp.py
 ```
 
 ## Real HQ training (data on host)
 
 1. Place `hq_manifest_v2.jsonl` somewhere readable (not in git).
 2. Map Windows inventory paths to the host, e.g. `F:\Dataset\...` → `/data/Dataset/...`
-3. Train **f8/V6**. `output_dir` must be a **new empty** directory (do not write into V5, V4, f4, or v2.2 runs):
+3. Train **f8/V8**. `output_dir` must be a **new empty** directory (do not write into V6, V5, V4, f4, or v2.2 runs):
 
 ```bash
 python -m microscopy_vae.cli train \
-  --config configs/experiment/s1_hq_f8z4_v6.yaml \
+  --config configs/experiment/s1_hq_f8z4_v8.yaml \
   --override data.manifest_path=/data/inventory/hq_manifest_v2.jsonl \
   --override data.path_prefix_source='F:\\Dataset' \
   --override data.path_prefix_target=/data/Dataset \
   --override data.path_require_exists=true \
-  --override experiment.output_dir=/data/runs/s1_hq_f8z4_v6_seed0 \
+  --override experiment.output_dir=/data/runs/s1_hq_f8z4_v8_seed0 \
   --override experiment.seed=0
 ```
 
-Two GPUs, **same** global batch 8 (do not set `training.ddp_scale_global_batch`):
+Four GPUs, **same** global batch 8 (`per_device=2 × accum=1`; do not set `training.ddp_scale_global_batch`):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
+  -m microscopy_vae.cli train \
+  --config configs/experiment/s1_hq_f8z4_v8.yaml \
+  --override data.manifest_path=/data/inventory/hq_manifest_v2.jsonl \
+  --override data.path_prefix_source='F:\\Dataset' \
+  --override data.path_prefix_target=/data/Dataset \
+  --override data.path_require_exists=true \
+  --override experiment.output_dir=/data/runs/s1_hq_f8z4_v8_seed0_4gpu \
+  --override experiment.seed=0
+```
+
+Two GPUs, **same** global batch 8 (`per_device=4 × accum=1`):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   -m microscopy_vae.cli train \
-  --config configs/experiment/s1_hq_f8z4_v6.yaml \
+  --config configs/experiment/s1_hq_f8z4_v8.yaml \
   --override data.manifest_path=/data/inventory/hq_manifest_v2.jsonl \
   --override data.path_prefix_source='F:\\Dataset' \
   --override data.path_prefix_target=/data/Dataset \
   --override data.path_require_exists=true \
-  --override experiment.output_dir=/data/runs/s1_hq_f8z4_v6_seed0 \
+  --override experiment.output_dir=/data/runs/s1_hq_f8z4_v8_seed0 \
   --override experiment.seed=0
 ```
 
 Do **not** use the frozen test split. Do **not** load f4 checkpoints into f8. Unset leftover `RANK`/`WORLD_SIZE`/`LOCAL_RANK` before a single-GPU `python -m` launch.
 
-Logs must show `experiment=s1_hq_f8z4_v6`, `effective_global=8`, `calibrate_thresholds=True`, `spatial_compression=8`, `threshold_version=microvae-thresholds-v2`, three per-source scales with `low=0`, and BioTISR/DeepInsight_2D `support_floor` **below 0.02**. Perc starts at step 1000; GAN is off; independent Scharr/HF/Flux stay at 0. Val logs `nmse` and `ssim_local`.
+Logs must show `experiment=s1_hq_f8z4_v8`, `effective_global=8`, `calibrate_thresholds=True`, `spatial_compression=8`, `threshold_version=microvae-thresholds-v2`, `affine=y = x/high`, three per-source scales with `low=0` (negatives are kept, `frac_lt0` may be >0), and BioTISR/DeepInsight_2D `support_floor` **below 0.02**. Perc starts at step 1000; GAN is off; independent Scharr/HF/Flux stay at 0. Val logs `nmse` and `ssim_local`.
 
 ## Inference
 
 Use the same config, EMA checkpoint, and `normalizer.json` from that run. Prefer **native-page full** or **halo** (real neighbors). Do not crop a 256 patch out of a larger FOV and send it alone. `--tiled` on a large image upgrades to halo unless `--allow-isolated-tiles`.
 
 ```bash
-CFG=configs/experiment/s1_hq_f8z4_v6.yaml
-CKPT=/data/runs/s1_hq_f8z4_v6_seed0/checkpoints/best_mae.pt
-NORM=/data/runs/s1_hq_f8z4_v6_seed0/normalizer.json
+CFG=configs/experiment/s1_hq_f8z4_v8.yaml
+CKPT=/data/runs/s1_hq_f8z4_v8_seed0/checkpoints/best_mae.pt
+NORM=/data/runs/s1_hq_f8z4_v8_seed0/normalizer.json
 
 # Native page, full image (one GPU)
 python -m microscopy_vae.cli infer --config $CFG --weights $CKPT --normalizer $NORM \
@@ -151,7 +177,7 @@ Do not assume more GPUs are always faster; measure on the target host.
 
 ```text
 src/microscopy_vae/   # package
-configs/              # YAML experiments (V6 recommended, V5/V4/v2.2 controls)
+configs/              # YAML experiments (V8 official, V6/V5/V4 frozen controls)
 tools/                # manifest, loss tables, infer bench
 tests/                # unit + integration
 ```

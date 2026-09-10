@@ -60,6 +60,9 @@ def canonical_resolved_dict(cfg: RootConfig) -> Dict[str, Any]:
     exp = dict(d.get("experiment") or {})
     exp["allow_existing_output"] = False
     d["experiment"] = exp
+    ev = dict(d.get("evaluation") or {})
+    ev.pop("batch_size", None)
+    d["evaluation"] = ev
     return d
 
 

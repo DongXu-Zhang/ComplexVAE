@@ -51,10 +51,13 @@ class NormalizationConfig(BaseModel):
     max_pixels_per_page: int = 65536
     low_percentile: float = 0.1
     high_percentile: float = 99.9
-    # Raw intensity floor applied before fit and transform. Off = V2.2 behaviour.
+    # Raw intensity floor applied before fit and transform.
+    # Off + per_source: keep signed values, still pin low=0 so y=x/high (V8).
+    # Off + global: percentile low (V2.2). On: max(x, floor) then y=x/high (V4–V6).
     raw_floor_enabled: bool = False
     raw_floor_value: float = 0.0
     # global: one affine for all sources. per_source: train-only (low, high) per source.
+    # per_source always pins low to 0 (or raw_floor_value); high is that source's p_high.
     scale_mode: Literal["global", "per_source"] = "global"
     # If false, refuse to load an artifact whose floor/percentiles differ from this config.
     allow_legacy_artifact: bool = True
@@ -368,6 +371,9 @@ class EvaluationConfig(BaseModel):
     report_constant_baseline: bool = True
     max_bootstrap: int = 200  # cap for wall-clock; full n_resamples only if smaller
     extended_metrics: bool = False
+    # Execution-only val microbatch. None → 8. Not part of the scientific
+    # recipe (per-page metrics then group-macro). Excluded from config hash.
+    batch_size: Optional[int] = None
     # Post-hoc report only (eval-val-report). Not training losses.
     severe_mae_unit: float = 0.10
     severe_bg_fp_rate: float = 0.15
